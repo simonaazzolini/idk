@@ -333,21 +333,22 @@ async def run_tests() -> int:
 async def main() -> None:
     args = parse_args()
 
-    # Setup logging first
-    log_level = args.log_level or "INFO"
+    # Apply settings overrides first so log level is correct
+    s = default_settings
+    apply_overrides(s, args)
+
+    # Setup logging
+    log_level = args.log_level or s.log_level or "INFO"
     setup_logging(log_level)
+    _logger = logging.getLogger(__name__)
 
     # Run tests if requested
     if args.test:
         exit_code = await run_tests()
         sys.exit(exit_code)
 
-    # Apply settings overrides
-    s = default_settings
-    apply_overrides(s, args)
-
     mode = args.mode.upper()
-    logger.info("Starting Polymarket Elite Bot | mode=%s | budget=$%.2f", mode, s.budget)
+    _logger.info("Starting Polymarket Elite Bot | mode=%s | budget=$%.2f", mode, s.budget)
 
     # Validate credentials (skip for paper mode with --test)
     if mode == "LIVE":
@@ -362,7 +363,7 @@ async def main() -> None:
         # Paper mode: warn but don't block
         errors = s.validate()
         if errors:
-            logger.warning("Some credentials missing (OK for paper mode): %s", ", ".join(errors))
+            _logger.warning("Some credentials missing (OK for paper mode): %s", ", ".join(errors))
 
     # Initialize database
     db = Database(s.db_path)
@@ -371,13 +372,13 @@ async def main() -> None:
     # Handle --reset-paper
     if args.reset_paper:
         await db.set_state("paper_start_ts", str(__import__("time").time()))
-        logger.info("Paper trading period reset")
+        _logger.info("Paper trading period reset")
 
     # Check if mode was persisted from previous session
     stored_mode = await db.get_state("mode")
     if stored_mode and not args.reset_paper:
         if stored_mode == "LIVE" and mode == "PAPER":
-            logger.info("Restoring LIVE mode from previous session")
+            _logger.info("Restoring LIVE mode from previous session")
             mode = "LIVE"
 
     # Initialize client
@@ -396,10 +397,10 @@ async def main() -> None:
     try:
         await bot.run()
     except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received")
+        _logger.info("Keyboard interrupt received")
     finally:
         await client.shutdown()
-        logger.info("Bot stopped.")
+        _logger.info("Bot stopped.")
 
 
 if __name__ == "__main__":
