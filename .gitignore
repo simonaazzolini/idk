@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Credentials — never commit
+config/.env
+
+# Runtime artifacts
+polymarket_bot/*.db
+polymarket_bot/*.log
+*.db
+*.log
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
