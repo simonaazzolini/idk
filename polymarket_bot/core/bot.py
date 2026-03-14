@@ -415,7 +415,7 @@ class PolymarketBot:
                 # Check cache
                 cached = await self.cache.get_price_history(yes_token, "1h")
                 if cached is None:
-                    history = await self.client.clob.get_prices_history(yes_token, "1h", 60)
+                    history = await self.client.data.get_prices_history(yes_token, "1h", 60)
                     await self.cache.set_price_history(yes_token, "1h", history)
                 else:
                     history = cached

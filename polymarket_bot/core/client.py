@@ -180,6 +180,23 @@ class DataClient:
             trades = []
         return [t for t in trades if float(t.get("timestamp", 0)) >= since_ts]
 
+    async def get_prices_history(
+        self,
+        token_id: str,
+        interval: str = "1h",
+        fidelity: int = 60,
+    ) -> list[dict]:
+        """Fetch price history from the Data API (/prices-history)."""
+        data = await self._get(
+            "/prices-history",
+            {"market": token_id, "interval": interval, "fidelity": fidelity},
+        )
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("history", data.get("data", []))
+        return []
+
 
 class ClobApiClient:
     """Wrapper around py-clob-client for orderbook and order management."""

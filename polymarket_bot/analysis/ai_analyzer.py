@@ -299,8 +299,12 @@ class AIAnalyzer:
                 messages=[{"role": "user", "content": prompt}],
             )
         except anthropic.APIError as e:
-            logger.error("Anthropic API error: %s", e)
-            raise
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in ("credit", "billing", "balance", "payment", "quota", "overdue")):
+                logger.warning("Anthropic billing/credit error — skipping AI analysis: %s", e)
+            else:
+                logger.error("Anthropic API error: %s", e)
+            return None
 
         # Extract all text blocks
         text_parts = []

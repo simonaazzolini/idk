@@ -103,14 +103,14 @@ class MarketDataCache:
     async def get_news(self, market_slug: str) -> Optional[dict]:
         return await self.news.get(f"news:{market_slug}")
 
-    async def set_news(self, market_slug: str, data: dict) -> None:
-        await self.news.set(f"news:{market_slug}", data)
+    async def set_news(self, market_slug: str, data: dict, ttl_seconds: Optional[float] = None) -> None:
+        await self.news.set(f"news:{market_slug}", data, ttl_seconds=ttl_seconds)
 
     async def get_ai_analysis(self, market_slug: str) -> Optional[dict]:
         return await self.ai_analysis.get(f"ai:{market_slug}")
 
-    async def set_ai_analysis(self, market_slug: str, data: dict) -> None:
-        await self.ai_analysis.set(f"ai:{market_slug}", data)
+    async def set_ai_analysis(self, market_slug: str, data: dict, ttl_seconds: Optional[float] = None) -> None:
+        await self.ai_analysis.set(f"ai:{market_slug}", data, ttl_seconds=ttl_seconds)
 
     async def get_whale_positions(self, market_slug: str) -> Optional[list]:
         return await self.whale_positions.get(f"wp:{market_slug}")

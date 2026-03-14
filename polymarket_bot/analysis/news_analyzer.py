@@ -142,13 +142,21 @@ class NewsAnalyzer:
 
         messages = [{"role": "user", "content": prompt}]
 
-        response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=2000,
-            system=NEWS_SYSTEM_PROMPT,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
-            messages=messages,
-        )
+        try:
+            response = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=2000,
+                system=NEWS_SYSTEM_PROMPT,
+                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
+                messages=messages,
+            )
+        except anthropic.APIError as e:
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in ("credit", "billing", "balance", "payment", "quota", "overdue")):
+                logger.warning("Anthropic billing/credit error — skipping news analysis: %s", e)
+            else:
+                logger.error("Anthropic API error in news analysis: %s", e)
+            return self._empty_result()
 
         # Extract JSON from response
         result_text = ""
