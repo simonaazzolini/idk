@@ -90,19 +90,21 @@ class BotProcessManager:
 
     async def _pipe_output(self) -> None:
         """Forward bot stdout/stderr to the server's logger."""
-        if not self._proc or not self._proc.stdout:
+        proc = self._proc  # capture local ref so we don't clobber a new process
+        if not proc or not proc.stdout:
             return
         try:
-            async for raw in self._proc.stdout:
+            async for raw in proc.stdout:
                 line = raw.decode(errors="replace").rstrip()
                 if line:
                     logger.info("[bot] %s", line)
         except Exception:
             pass
-        rc = self._proc.returncode if self._proc else None
+        rc = proc.returncode
         logger.info("Bot process exited (rc=%s)", rc)
-        self._proc = None
-        self._start_ts = None
+        if self._proc is proc:  # only clear if no new process has been started
+            self._proc = None
+            self._start_ts = None
 
 
 # ── Background tasks ──────────────────────────────────────────────────────────

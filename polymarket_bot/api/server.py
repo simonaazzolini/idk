@@ -811,11 +811,16 @@ class APIServer:
                 if pm:
                     mode   = body.get("mode", "paper")
                     budget = body.get("budget") or None
+                    # Write mode before starting so the subprocess sees the correct
+                    # state in _check_db_commands and doesn't read stale STOPPED.
+                    await _execute(db, "INSERT OR REPLACE INTO bot_state(key,value) VALUES('mode',?)",
+                                   (mode.upper(),))
                     result = await pm.start(mode=mode, budget=budget)
                     if result["success"]:
-                        await _execute(db, "INSERT OR REPLACE INTO bot_state(key,value) VALUES('mode',?)",
-                                       (mode.upper(),))
                         await mgr.broadcast("mode_change", {"old_mode": "STOPPED", "new_mode": mode.upper()})
+                    else:
+                        # Revert if the process couldn't be launched
+                        await _execute(db, "INSERT OR REPLACE INTO bot_state(key,value) VALUES('mode','STOPPED')")
                     return result
                 if bot:
                     return {"success": False, "message": "Bot is already running"}

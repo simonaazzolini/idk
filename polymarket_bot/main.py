@@ -5,6 +5,7 @@ CLI for starting the Polymarket trading bot.
 import argparse
 import asyncio
 import logging
+import signal
 import sys
 from pathlib import Path
 
@@ -394,11 +395,17 @@ async def main() -> None:
         budget=s.budget,
     )
 
+    # Cancel this task on SIGTERM so bot._shutdown() runs instead of dying at rc=-15
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    loop.add_signal_handler(signal.SIGTERM, main_task.cancel)
+
     try:
         await bot.run()
-    except KeyboardInterrupt:
-        _logger.info("Keyboard interrupt received")
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        _logger.info("Shutdown signal received")
     finally:
+        loop.remove_signal_handler(signal.SIGTERM)
         await client.shutdown()
         _logger.info("Bot stopped.")
 
