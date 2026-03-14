@@ -803,6 +803,14 @@ class APIServer:
         async def control(request: Request):
             body = await request.json()
             action = body.get("action", "")
+
+            # Guard destructive actions — require explicit human confirmation so
+            # automated callers (scripts, bots, misbehaving clients) cannot
+            # trigger them unintentionally.
+            _DESTRUCTIVE = {"stop", "emergency_stop", "cancel_all_orders", "close_all_positions"}
+            if action in _DESTRUCTIVE and not body.get("human_confirmed"):
+                raise HTTPException(400, "human_confirmed required")
+
             bot = server_self.bot_ref
             pm  = server_self.process_manager
 

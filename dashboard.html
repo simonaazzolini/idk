@@ -784,9 +784,10 @@ function handleWsMessage(msg) {
       break;
     case 'paper_evaluation':
       if (data.go) {
-        addEvent('info', '✅ Paper eval: GO — live trading confirmation required');
-        toast('Paper period complete — bot is ready for live trading!', 'warn', 8000);
-        promptActivateLive({ fromBot: true });
+        addEvent('info', '✅ Paper eval: GO — click "Go Live" button to activate live trading');
+        toast('Paper period complete! Click "Go Live" when ready.', 'warn', 10000);
+        // NOTE: do NOT auto-call promptActivateLive here — the user must click
+        // the "Go Live" button manually. Automated calls caused unintended stops.
       } else {
         addEvent('info', '❌ Paper eval: NO-GO — continuing paper trading');
         toast('Paper eval: NO-GO. Continuing paper trading.', 'info', 5000);
@@ -1232,19 +1233,22 @@ async function startBot(mode) {
 $('ctrl-start-paper').onclick = () => startBot('paper');
 $('ctrl-start-live').onclick  = () => startBot('live');
 $('ctrl-resume').onclick = () => ctrl('resume');
-$('ctrl-pause').onclick  = () => ctrl('pause');
+$('ctrl-pause').onclick  = async () => {
+  const ok = await showModal('Pause Bot', 'Pause the bot? Trading will halt until you click Resume.');
+  if (ok) ctrl('pause');
+};
 $('ctrl-stop').onclick   = async () => {
   const ok = await showModal('Stop Bot', 'Are you sure you want to stop the bot?');
-  if (ok) ctrl('stop');
+  if (ok) ctrl('stop', {human_confirmed: true});
 };
 $('ctrl-cycle').onclick         = () => ctrl('restart_cycle');
 $('ctrl-cancel-orders').onclick = async () => {
   const ok = await showModal('Cancel Orders', 'Cancel all open orders?');
-  if (ok) ctrl('cancel_all_orders');
+  if (ok) ctrl('cancel_all_orders', {human_confirmed: true});
 };
 $('ctrl-close-pos').onclick    = async () => {
   const ok = await showModal('Close All Positions', 'Close ALL open positions? This cannot be undone.');
-  if (ok) ctrl('close_all_positions');
+  if (ok) ctrl('close_all_positions', {human_confirmed: true});
 };
 $('ctrl-reset-paper').onclick  = async () => {
   const ok = await showModal('Reset Paper', 'Reset the 48-hour paper trading period?');
@@ -1262,7 +1266,7 @@ async function promptActivateLive({ fromBot = false } = {}) {
     { needInput: true, placeholder: 'CONFIRM LIVE TRADING', confirmClass: 'btn-danger' });
   if (!phrase || phrase === true) return;
   if (phrase.trim() === 'CONFIRM LIVE TRADING') {
-    ctrl('activate_live', { confirm_phrase: 'CONFIRM LIVE TRADING' });
+    ctrl('activate_live', { confirm_phrase: 'CONFIRM LIVE TRADING', human_confirmed: true });
   } else {
     toast('Invalid confirmation phrase', 'error');
   }
