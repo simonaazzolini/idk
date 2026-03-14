@@ -222,7 +222,16 @@ class WhaleTracker:
         """
         Aggregate smart money positions for a market.
         Returns consensus direction, conviction score, and breakdown.
+        Returns _empty_consensus() on any error so callers always get a valid dict.
         """
+        try:
+            return await self._get_smart_money_consensus_inner(market_slug)
+        except Exception as exc:
+            logger.warning("Smart money consensus error for %s: %s", market_slug, exc)
+            return self._empty_consensus()
+
+    async def _get_smart_money_consensus_inner(self, market_slug: str) -> dict:
+        """Inner implementation for get_smart_money_consensus."""
         positions = await self.db.get_whale_positions_for_market(market_slug)
         if not positions:
             return self._empty_consensus()
@@ -435,7 +444,16 @@ class WhaleTracker:
     def get_whale_score_for_market(self, consensus: dict) -> tuple[float, str]:
         """
         Convert smart money consensus into a 0-10 signal score and direction.
+        Returns (0.0, 'NEUTRAL') on any error.
         """
+        try:
+            return self._get_whale_score_inner(consensus)
+        except Exception as exc:
+            logger.warning("Whale score computation error: %s", exc)
+            return 0.0, "NEUTRAL"
+
+    def _get_whale_score_inner(self, consensus: dict) -> tuple[float, str]:
+        """Inner implementation for get_whale_score_for_market."""
         conviction = float(consensus.get("smart_money_conviction", 0))
         net_dir = str(consensus.get("smart_money_net_direction", "NEUTRAL"))
 

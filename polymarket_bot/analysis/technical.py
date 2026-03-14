@@ -95,6 +95,22 @@ def compute_technical_signals(
     if not price_history:
         return sig
 
+    try:
+        return _compute_signals_inner(sig, price_history, current_price, volume_24h, days_to_resolution)
+    except Exception as exc:
+        logger.warning("Technical analysis error — returning safe defaults: %s", exc)
+        return TechnicalSignal()
+
+
+def _compute_signals_inner(
+    sig: TechnicalSignal,
+    price_history: list[dict],
+    current_price: float,
+    volume_24h: float,
+    days_to_resolution: float,
+) -> TechnicalSignal:
+    """Inner computation — isolated so the public function can catch all errors."""
+
     df = _build_df(price_history)
     if df is None or len(df) < 3:
         # Minimal 2-point momentum estimate

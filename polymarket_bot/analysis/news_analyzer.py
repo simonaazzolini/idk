@@ -327,8 +327,16 @@ class NewsAnalyzer:
     # ── Scoring ────────────────────────────────────────────────────────────────
 
     def _compute_news_score(self, result: dict) -> float:
+        """Compute a composite news signal score in [0, 10]. Returns 5.0 on error."""
+        try:
+            return self._compute_news_score_inner(result)
+        except Exception as exc:
+            logger.warning("News score computation error — returning neutral 5.0: %s", exc)
+            return 5.0
+
+    def _compute_news_score_inner(self, result: dict) -> float:
         """
-        Compute a composite news signal score in [0, 10].
+        Inner scoring logic.
 
         Components:
           - Sentiment direction:   −1..+1 → core directional signal
@@ -339,8 +347,6 @@ class NewsAnalyzer:
           - Surprise risk:         penalty reducing confidence in any direction
           - Base rate alignment:   bonus when sentiment agrees with known base rate
           - Market price vs news:  slight bonus when news identifies mispricing
-
-        Formula (all ranges and weights documented inline):
 
         Returns a float in [0.0, 10.0].  5.0 = no signal.
         """

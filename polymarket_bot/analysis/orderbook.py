@@ -81,6 +81,15 @@ def analyze_orderbook(book: dict) -> OrderbookMetrics:
     Returns OrderbookMetrics with defaults when the book is empty.
     """
     m = OrderbookMetrics()
+    try:
+        return _analyze_orderbook_inner(m, book)
+    except Exception as exc:
+        logger.warning("Orderbook analysis error — returning safe defaults: %s", exc)
+        return OrderbookMetrics()
+
+
+def _analyze_orderbook_inner(m: OrderbookMetrics, book: dict) -> OrderbookMetrics:
+    """Inner implementation — called inside a try/except by analyze_orderbook."""
     bids = book.get("bids", [])
     asks = book.get("asks", [])
 

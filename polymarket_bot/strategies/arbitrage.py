@@ -310,39 +310,43 @@ class ArbitrageDetector:
 
         for market in markets:
             slug = market.get("slug") or market.get("conditionId", "")
-            tokens = market.get("clobTokenIds") or []
-            if isinstance(tokens, str):
-                try:
-                    tokens = json.loads(tokens)
-                except json.JSONDecodeError:
-                    tokens = []
+            try:
+                tokens = market.get("clobTokenIds") or []
+                if isinstance(tokens, str):
+                    try:
+                        tokens = json.loads(tokens)
+                    except json.JSONDecodeError:
+                        tokens = []
 
-            yes_token = str(tokens[0]) if len(tokens) > 0 else ""
-            no_token = str(tokens[1]) if len(tokens) > 1 else ""
+                yes_token = str(tokens[0]) if len(tokens) > 0 else ""
+                no_token = str(tokens[1]) if len(tokens) > 1 else ""
 
-            yes_raw = orderbooks.get(yes_token)
-            no_raw = orderbooks.get(no_token)
-            yes_metrics = analyze_orderbook(yes_raw) if yes_raw else None
-            no_metrics = analyze_orderbook(no_raw) if no_raw else None
+                yes_raw = orderbooks.get(yes_token)
+                no_raw = orderbooks.get(no_token)
+                yes_metrics = analyze_orderbook(yes_raw) if yes_raw else None
+                no_metrics = analyze_orderbook(no_raw) if no_raw else None
 
-            # Type 1
-            if yes_metrics and no_metrics:
-                t1 = self.detect_yes_no_arb(market, yes_metrics, no_metrics)
-                if t1:
-                    opportunities.append(t1)
-                    logger.info("TYPE_1 ARB: %s profit=%.1f%%", slug[:30], t1.profit_pct * 100)
+                # Type 1
+                if yes_metrics and no_metrics:
+                    t1 = self.detect_yes_no_arb(market, yes_metrics, no_metrics)
+                    if t1:
+                        opportunities.append(t1)
+                        logger.info("TYPE_1 ARB: %s profit=%.1f%%", slug[:30], t1.profit_pct * 100)
 
-            # Type 4
-            if yes_metrics:
-                t4 = self.detect_spread_capture(market, yes_metrics)
-                if t4:
-                    opportunities.append(t4)
+                # Type 4
+                if yes_metrics:
+                    t4 = self.detect_spread_capture(market, yes_metrics)
+                    if t4:
+                        opportunities.append(t4)
 
-            # Type 5
-            days = days_to_resolution_map.get(slug, 30.0)
-            t5 = self.detect_time_decay_arb(market, days)
-            if t5:
-                opportunities.append(t5)
+                # Type 5
+                days = days_to_resolution_map.get(slug, 30.0)
+                t5 = self.detect_time_decay_arb(market, days)
+                if t5:
+                    opportunities.append(t5)
+
+            except Exception as exc:
+                logger.debug("Arb scan error for market %s: %s", slug, exc)
 
         # Sort by urgency
         opportunities.sort(key=lambda x: x.urgency, reverse=True)

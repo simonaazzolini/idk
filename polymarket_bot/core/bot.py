@@ -13,6 +13,7 @@ from typing import Optional
 
 from analysis.ai_analyzer import AIAnalyzer
 from analysis.news_analyzer import NewsAnalyzer
+from core.startup_check import run_startup_checks
 from analysis.orderbook import analyze_orderbook, analyze_cross_token
 from analysis.technical import compute_technical_signals
 from config.settings import Settings
@@ -122,6 +123,9 @@ class PolymarketBot:
         self.dashboard.paper_end_ts = self._paper_start_ts + 48 * 3600
         self.dashboard.portfolio_state = self.portfolio.state
         self.dashboard.start()
+
+        # Startup self-test: verify all external dependencies before first cycle
+        await run_startup_checks(self.client, self.db, self.settings)
 
         # Initial whale database build (background)
         if await self.whale_tracker.should_do_full_refresh():
