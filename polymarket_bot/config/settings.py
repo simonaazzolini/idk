@@ -114,9 +114,14 @@ class Settings:
     ws_reconnect_max_seconds: float = 60.0
     ws_price_shock_threshold_pct: float = 0.05  # 5% move in 60s
 
+    # ── AI Model Selection ────────────────────────────────────────────────────
+    ai_model_analysis: str = "claude-haiku-4-5-20251001"  # cheap/fast, default for all cycle analysis
+    ai_model_deep: str = "claude-opus-4-5"                # only: live mode + composite_score >= 8.0
+
     # ── Misc ──────────────────────────────────────────────────────────────────
     market_cache_ttl_minutes: int = 10
-    ai_min_call_interval_seconds: float = 3.0
+    ai_min_call_interval_seconds: float = 8.0   # minimum seconds between every Claude API call
+    ai_max_calls_per_minute: int = 8            # rate-limit window: halt when this many calls in 60s
     categories: list = field(default_factory=list)  # empty = all categories
 
     def validate(self) -> list[str]:

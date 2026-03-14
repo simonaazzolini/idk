@@ -220,13 +220,15 @@ class PolymarketBot:
         if can_trade:
             self._news_results = await self.news_analyzer.analyze_batch(markets[:20])
 
-        # Step 7: AI analysis (top 20 markets)
+        # Step 7: AI analysis (max 10 markets per cycle — rate limit budget)
         if can_trade:
             self._ai_results = await self.ai_analyzer.analyze_batch(
-                markets=markets[:20],
+                markets=markets,
+                max_markets=10,
                 technical_signals=self._technical_signals,
                 whale_consensuses=self._whale_consensuses,
                 news_results=self._news_results,
+                mode=self._mode,
             )
 
         # Step 8: Arb scan

@@ -1,11 +1,22 @@
 """
 AI Probability Engine — Module 6.
-Uses Claude claude-opus-4-5 with web search to estimate true outcome probabilities.
+Uses Claude with web search to estimate true outcome probabilities.
+
+Rate-limit strategy:
+  - Default model: claude-haiku-4-5-20251001  (fast, cheap, all cycle analysis)
+  - Deep model:    claude-opus-4-5             (live mode only, composite_score >= 8.0)
+  - Minimum 8 s between every call (ai_min_call_interval_seconds)
+  - Hard cap: 8 calls per 60-second window (ai_max_calls_per_minute)
+  - On 429: wait 60 s, retry up to 2 times, then skip
+  - Max 10 markets per cycle
+  - max_tokens = 1000
 """
 import asyncio
+import collections
 import json
 import logging
 import re
+import time
 from typing import Optional
 
 import anthropic
@@ -16,119 +27,126 @@ from utils.helpers import clamp, now_ts
 
 logger = logging.getLogger(__name__)
 
-AI_SYSTEM_PROMPT = """You are an elite prediction market analyst with expertise in probability estimation.
-Your job is to estimate the true probability of market outcomes using all available evidence.
-You approach this like a superforecaster: you look for base rates, update with specific evidence,
-avoid overconfidence, and always consider what could change your estimate.
+_RETRY_429_WAIT  = 60    # seconds to wait after a 429
+_MAX_429_RETRIES = 2     # max retries before skipping the market
+_TOKEN_LIMIT     = 20000 # estimated token threshold for prompt truncation
 
-CRITICAL RULES:
-1. Run AT LEAST 3 web searches, up to 6
-2. Always find a base rate first before looking at specific evidence
-3. Apply Bayesian updates: start from base rate, adjust based on current evidence
-4. Check prediction aggregators (Metaculus, Manifold, PredictIt) for market consensus
-5. Consider the exact resolution criteria - not just the general topic
-6. Calibrate for overconfidence - reduce confidence if you're uncertain
-7. Return ONLY valid JSON - no markdown, no preamble, no explanation outside JSON"""
 
-AI_ANALYSIS_PROMPT = """Analyze this prediction market and return a probability estimate.
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompts  (trimmed ~30% vs original — all analytical requirements kept)
+# ─────────────────────────────────────────────────────────────────────────────
 
-MARKET QUESTION: {question}
-CURRENT YES PRICE: {current_price:.4f} ({current_price_pct:.1%})
-DAYS TO RESOLUTION: {days_to_resolution:.1f}
-CATEGORY: {category}
+AI_SYSTEM_PROMPT = """Prediction market analyst. Estimate true outcome probabilities as a superforecaster.
+
+Rules:
+1. Run 3–6 web searches; find a base rate FIRST, then update with specific evidence
+2. Check Metaculus, Manifold, PredictIt for community consensus
+3. Consider exact resolution criteria (not just general topic)
+4. Calibrate: reduce confidence when uncertain; apply Bayesian updates
+5. Return ONLY valid JSON — no markdown, no text outside JSON"""
+
+
+AI_ANALYSIS_PROMPT = """Analyze this prediction market and estimate the true probability.
+
+QUESTION: {question}
+YES PRICE: {current_price:.4f}  |  DAYS TO RESOLUTION: {days_to_resolution:.1f}
+CATEGORY: {category}  |  RESOLUTION SOURCE: {resolution_source}
 DESCRIPTION: {description}
-RESOLUTION SOURCE: {resolution_source}
 
-KEY STATISTICS:
-- 24h volume: ${volume_24h:,.0f}
-- Liquidity: ${liquidity:,.0f}
-- Price 24h change: {price_change_24h:+.2%}
-- RSI(14): {rsi_14:.0f}
-- Whale direction: {whale_direction}
-- News sentiment: {news_sentiment}
+SIGNALS: vol_24h=${volume_24h:,.0f}  liquidity=${liquidity:,.0f}  \
+price_chg={price_change_24h:+.2%}  RSI={rsi_14:.0f}  \
+whales={whale_direction}  news={news_sentiment}
+NEWS SUMMARY: {news_summary}
 
-INSTRUCTIONS:
-1. Search for: "{question}"
-2. Search for base rates for this type of event
-3. Search for recent news and expert forecasts
-4. Search prediction aggregators: site:metaculus.com OR site:manifold.markets for "{topic_keywords}"
-5. Search for the resolution source: {resolution_source}
-6. Search for contra-evidence: reasons this might NOT happen
+SEARCHES TO RUN:
+1. Exact question text: "{question}"
+2. Base rate for this type of event
+3. Recent news and expert forecasts
+4. Aggregators: site:metaculus.com OR site:manifold.markets "{topic_keywords}"
+5. Resolution source: {resolution_source}
+6. Contra-evidence: reasons this does NOT happen
 
-Return ONLY this JSON (no markdown, no text outside JSON):
+Return ONLY this JSON:
 {{
-  "yes_probability": <float 0.0-1.0>,
+  "yes_probability": <float 0–1>,
   "confidence_interval_low": <float>,
   "confidence_interval_high": <float>,
-  "confidence": <float 0.0-1.0>,
-  "recommended_outcome": <"YES" | "NO" | "SKIP">,
+  "confidence": <float 0–1>,
+  "recommended_outcome": <"YES"|"NO"|"SKIP">,
   "base_rate": <float>,
   "base_rate_source": <string>,
-  "evidence_adjustment": <float, how much you shifted from base rate>,
-  "reasoning": <string, 3-5 sentences>,
-  "strongest_yes_evidence": <string>,
-  "strongest_no_evidence": <string>,
-  "key_facts": [<list of concrete facts found>],
-  "key_uncertainties": [<list of things that could change the outcome>],
-  "resolution_risk": <"LOW" | "MEDIUM" | "HIGH">,
+  "evidence_adjustment": <float>,
+  "reasoning": "<3–5 sentences>",
+  "strongest_yes_evidence": "<string>",
+  "strongest_no_evidence": "<string>",
+  "key_facts": [<strings>],
+  "key_uncertainties": [<strings>],
+  "resolution_risk": <"LOW"|"MEDIUM"|"HIGH">,
   "aggregator_consensus": <float or null>,
-  "news_summary": <string>,
-  "edge": <float, yes_probability minus current_yes_price>,
-  "signal_strength": <"WEAK" | "MODERATE" | "STRONG" | "VERY_STRONG">
+  "news_summary": "<string>",
+  "edge": <yes_probability minus current_yes_price>,
+  "signal_strength": <"WEAK"|"MODERATE"|"STRONG"|"VERY_STRONG">
 }}"""
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result types
+# ─────────────────────────────────────────────────────────────────────────────
 
 class AIAnalysisResult:
     """Typed result from the AI probability engine."""
 
     def __init__(self, data: dict):
-        self.yes_probability: float = float(data.get("yes_probability", 0.5))
-        self.confidence_interval_low: float = float(data.get("confidence_interval_low", 0.3))
+        self.yes_probability: float          = float(data.get("yes_probability", 0.5))
+        self.confidence_interval_low: float  = float(data.get("confidence_interval_low", 0.3))
         self.confidence_interval_high: float = float(data.get("confidence_interval_high", 0.7))
-        self.confidence: float = float(data.get("confidence", 0.5))
-        self.recommended_outcome: str = data.get("recommended_outcome", "SKIP")
-        self.base_rate: float = float(data.get("base_rate", 0.5))
-        self.base_rate_source: str = data.get("base_rate_source", "unknown")
-        self.evidence_adjustment: float = float(data.get("evidence_adjustment", 0.0))
-        self.reasoning: str = data.get("reasoning", "")
-        self.strongest_yes_evidence: str = data.get("strongest_yes_evidence", "")
-        self.strongest_no_evidence: str = data.get("strongest_no_evidence", "")
-        self.key_facts: list = data.get("key_facts", [])
-        self.key_uncertainties: list = data.get("key_uncertainties", [])
-        self.resolution_risk: str = data.get("resolution_risk", "MEDIUM")
+        self.confidence: float               = float(data.get("confidence", 0.5))
+        self.recommended_outcome: str        = data.get("recommended_outcome", "SKIP")
+        self.base_rate: float                = float(data.get("base_rate", 0.5))
+        self.base_rate_source: str           = data.get("base_rate_source", "unknown")
+        self.evidence_adjustment: float      = float(data.get("evidence_adjustment", 0.0))
+        self.reasoning: str                  = data.get("reasoning", "")
+        self.strongest_yes_evidence: str     = data.get("strongest_yes_evidence", "")
+        self.strongest_no_evidence: str      = data.get("strongest_no_evidence", "")
+        self.key_facts: list                 = data.get("key_facts", [])
+        self.key_uncertainties: list         = data.get("key_uncertainties", [])
+        self.resolution_risk: str            = data.get("resolution_risk", "MEDIUM")
         self.aggregator_consensus: Optional[float] = data.get("aggregator_consensus")
-        self.news_summary: str = data.get("news_summary", "")
-        self.edge: float = float(data.get("edge", 0.0))
-        self.signal_strength: str = data.get("signal_strength", "WEAK")
-        self.ai_score: float = 5.0  # computed separately
-        self.raw_data = data
+        self.news_summary: str               = data.get("news_summary", "")
+        self.edge: float                     = float(data.get("edge", 0.0))
+        self.signal_strength: str            = data.get("signal_strength", "WEAK")
+        self.ai_score: float                 = 5.0   # set after construction
+        self.raw_data                        = data
 
     def to_dict(self) -> dict:
         return {
-            "yes_probability": self.yes_probability,
-            "confidence_interval_low": self.confidence_interval_low,
+            "yes_probability":          self.yes_probability,
+            "confidence_interval_low":  self.confidence_interval_low,
             "confidence_interval_high": self.confidence_interval_high,
-            "confidence": self.confidence,
-            "recommended_outcome": self.recommended_outcome,
-            "base_rate": self.base_rate,
-            "base_rate_source": self.base_rate_source,
-            "evidence_adjustment": self.evidence_adjustment,
-            "reasoning": self.reasoning,
-            "strongest_yes_evidence": self.strongest_yes_evidence,
-            "strongest_no_evidence": self.strongest_no_evidence,
-            "key_facts": self.key_facts,
-            "key_uncertainties": self.key_uncertainties,
-            "resolution_risk": self.resolution_risk,
-            "aggregator_consensus": self.aggregator_consensus,
-            "news_summary": self.news_summary,
-            "edge": self.edge,
-            "signal_strength": self.signal_strength,
-            "ai_score": self.ai_score,
+            "confidence":               self.confidence,
+            "recommended_outcome":      self.recommended_outcome,
+            "base_rate":                self.base_rate,
+            "base_rate_source":         self.base_rate_source,
+            "evidence_adjustment":      self.evidence_adjustment,
+            "reasoning":                self.reasoning,
+            "strongest_yes_evidence":   self.strongest_yes_evidence,
+            "strongest_no_evidence":    self.strongest_no_evidence,
+            "key_facts":                self.key_facts,
+            "key_uncertainties":        self.key_uncertainties,
+            "resolution_risk":          self.resolution_risk,
+            "aggregator_consensus":     self.aggregator_consensus,
+            "news_summary":             self.news_summary,
+            "edge":                     self.edge,
+            "signal_strength":          self.signal_strength,
+            "ai_score":                 self.ai_score,
         }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Score helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 def compute_signal_strength(edge: float, confidence: float) -> str:
-    """Classify signal strength based on edge and confidence."""
     abs_edge = abs(edge)
     if abs_edge > 0.12 and confidence > 0.75:
         return "VERY_STRONG"
@@ -140,70 +158,117 @@ def compute_signal_strength(edge: float, confidence: float) -> str:
 
 
 def compute_ai_score(result: AIAnalysisResult) -> float:
-    """Compute AI signal score (0-10) from edge and confidence."""
-    edge_score = min(abs(result.edge) / 0.15 * 10.0, 10.0)
+    edge_score       = min(abs(result.edge) / 0.15 * 10.0, 10.0)
     confidence_score = result.confidence * 10.0
     return (edge_score * 0.7) + (confidence_score * 0.3)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main class
+# ─────────────────────────────────────────────────────────────────────────────
+
 class AIAnalyzer:
     """
-    AI Probability Engine using Claude claude-opus-4-5 with web search.
+    AI Probability Engine.
+
+    Model routing:
+        Regular cycle analysis → settings.ai_model_analysis  (Haiku, fast+cheap)
+        Live trade confirmation → settings.ai_model_deep      (Opus, only when
+            mode == 'LIVE' AND composite_score >= 8.0)
+
+    Rate limiting (enforced before every call):
+        - Minimum gap:  settings.ai_min_call_interval_seconds (8 s default)
+        - Window cap:   settings.ai_max_calls_per_minute calls per 60 s window
+        - 429 handling: wait 60 s, retry ≤ 2 times, then skip market
     """
 
     def __init__(self, settings: Settings, cache: MarketDataCache):
-        self.settings = settings
-        self.cache = cache
-        self._client: Optional[anthropic.Anthropic] = None
+        self.settings  = settings
+        self.cache     = cache
+        self._client:  Optional[anthropic.Anthropic] = None
         self._last_call_ts: float = 0.0
-        self._total_calls: int = 0
-        self._call_errors: int = 0
+        self._total_calls:  int   = 0
+        self._call_errors:  int   = 0
+        # Sliding-window call timestamps for per-minute rate limiting
+        self._call_timestamps: collections.deque = collections.deque()
 
     def _get_client(self) -> anthropic.Anthropic:
         if self._client is None:
             self._client = anthropic.Anthropic(api_key=self.settings.anthropic_api_key)
         return self._client
 
+    # ── Public analysis entry points ──────────────────────────────────────────
+
     async def analyze_market(
         self,
         market: dict,
         technical_signal=None,
         whale_consensus: Optional[dict] = None,
-        news_result: Optional[dict] = None,
+        news_result:     Optional[dict] = None,
+        mode:            str   = "PAPER",
+        composite_score: float = 0.0,
     ) -> Optional[AIAnalysisResult]:
         """
-        Run deep AI analysis on a single market.
-        Returns AIAnalysisResult or None if analysis should be skipped.
+        Run AI analysis on a single market.
+
+        Model selection:
+            - mode == 'LIVE' AND composite_score >= 8.0 → deep model (Opus)
+            - all other cases                           → analysis model (Haiku)
+
+        Returns AIAnalysisResult or None when analysis should be skipped.
         """
         slug = market.get("slug") or market.get("conditionId", "unknown")
 
-        # Check cache
+        # Cache check
         cached = await self.cache.get_ai_analysis(slug)
         if cached:
             result = AIAnalysisResult(cached)
             result.ai_score = compute_ai_score(result)
             return result
 
-        # Enforce rate limit
-        await self._enforce_rate_limit()
+        # Model selection
+        use_deep_model = (mode.upper() == "LIVE" and composite_score >= 8.0)
+        model = (
+            self.settings.ai_model_deep
+            if use_deep_model
+            else self.settings.ai_model_analysis
+        )
+        if use_deep_model:
+            logger.info(
+                "Using DEEP model (%s) for %s (live mode, score=%.1f)",
+                model, slug[:30], composite_score,
+            )
 
-        # Extract market data
+        # Extract market fields
         question = market.get("question", "Unknown")
-        current_price = float((market.get("outcomePrices") or [0.5])[0] if isinstance(market.get("outcomePrices"), list) else 0.5)
-        days_to_resolution = float(market.get("days_to_resolution") or 30.0)
-        category = str(market.get("category") or "general")
-        description = str(market.get("description") or "")[:800]
-        resolution_source = str(market.get("resolutionSource") or market.get("resolution_source") or "Not specified")
-        volume_24h = float(market.get("volume24hr") or market.get("volume_24h") or 0)
-        liquidity = float(market.get("liquidity") or 0)
-        price_change_24h = float(technical_signal.price_change_24h if technical_signal else 0.0)
-        rsi = float(technical_signal.rsi_14 if technical_signal else 50.0)
-        whale_dir = whale_consensus.get("smart_money_net_direction", "NEUTRAL") if whale_consensus else "NEUTRAL"
-        news_sent = str(news_result.get("consensus_direction", "UNCERTAIN")) if news_result else "UNKNOWN"
+        raw_prices = market.get("outcomePrices", [0.5])
+        current_price = float(
+            raw_prices[0] if isinstance(raw_prices, list) and raw_prices else 0.5
+        )
+        days_to_resolution  = float(market.get("days_to_resolution") or 30.0)
+        category            = str(market.get("category") or "general")
+        description         = str(market.get("description") or "")[:800]
+        resolution_source   = str(
+            market.get("resolutionSource") or market.get("resolution_source") or "Not specified"
+        )
+        volume_24h   = float(market.get("volume24hr") or market.get("volume_24h") or 0)
+        liquidity    = float(market.get("liquidity") or 0)
+        price_chg_24 = float(technical_signal.price_change_24h if technical_signal else 0.0)
+        rsi          = float(technical_signal.rsi_14 if technical_signal else 50.0)
+        whale_dir    = (
+            whale_consensus.get("smart_money_net_direction", "NEUTRAL")
+            if whale_consensus else "NEUTRAL"
+        )
+        news_sent = str(
+            news_result.get("consensus_direction", "UNCERTAIN") if news_result else "UNKNOWN"
+        )
+        news_summary = str(
+            (news_result.get("news_summary") or "")[:300] if news_result else ""
+        )
+        topic_keywords = " ".join(w for w in question.split() if len(w) > 3)[:50]
 
-        # Extract topic keywords for aggregator search
-        words = question.split()
-        topic_keywords = " ".join(w for w in words if len(w) > 3)[:50]
+        # Rate limit enforcement
+        await self._enforce_rate_limit()
 
         try:
             raw_result = await asyncio.get_event_loop().run_in_executor(
@@ -217,11 +282,13 @@ class AIAnalyzer:
                     resolution_source=resolution_source,
                     volume_24h=volume_24h,
                     liquidity=liquidity,
-                    price_change_24h=price_change_24h,
+                    price_change_24h=price_chg_24,
                     rsi_14=rsi,
                     whale_direction=whale_dir,
                     news_sentiment=news_sent,
+                    news_summary=news_summary,
                     topic_keywords=topic_keywords,
+                    model=model,
                 ),
             )
         except Exception as e:
@@ -238,19 +305,54 @@ class AIAnalyzer:
             raw_result["edge"], raw_result.get("confidence", 0.5)
         )
 
-        result = AIAnalysisResult(raw_result)
+        result          = AIAnalysisResult(raw_result)
         result.ai_score = compute_ai_score(result)
 
-        # Cache result
-        cache_data = result.to_dict()
-        await self.cache.set_ai_analysis(slug, cache_data, ttl_seconds=900)
+        await self.cache.set_ai_analysis(slug, result.to_dict(), ttl_seconds=900)
 
         logger.info(
-            "AI: %s | P(YES)=%.3f | edge=%.3f | conf=%.2f | signal=%s",
+            "AI [%s]: %s | P(YES)=%.3f | edge=%.3f | conf=%.2f | signal=%s",
+            "DEEP" if use_deep_model else "HAIKU",
             slug[:30], result.yes_probability, result.edge,
-            result.confidence, result.signal_strength
+            result.confidence, result.signal_strength,
         )
         return result
+
+    async def analyze_batch(
+        self,
+        markets: list[dict],
+        max_markets: int = 10,           # cap: 10 markets per cycle
+        technical_signals:  Optional[dict] = None,
+        whale_consensuses:  Optional[dict] = None,
+        news_results:       Optional[dict] = None,
+        mode:               str   = "PAPER",
+        composite_scores:   Optional[dict] = None,
+    ) -> dict[str, Optional[AIAnalysisResult]]:
+        """
+        Analyze up to max_markets markets sequentially (concurrency = 1).
+        Per-market errors are isolated — one failure does not stop the batch.
+        """
+        results: dict[str, Optional[AIAnalysisResult]] = {}
+        for market in markets[:max_markets]:
+            slug  = market.get("slug") or market.get("conditionId", "unknown")
+            tech  = technical_signals.get(slug)  if technical_signals  else None
+            whale = whale_consensuses.get(slug)  if whale_consensuses  else None
+            news  = news_results.get(slug)        if news_results       else None
+            cscore = float(
+                composite_scores.get(slug, 0.0) if composite_scores else 0.0
+            )
+            try:
+                result = await self.analyze_market(
+                    market, tech, whale, news,
+                    mode=mode, composite_score=cscore,
+                )
+                results[slug] = result
+            except Exception as e:
+                logger.warning("AI analysis error for %s: %s", slug, e)
+                results[slug] = None
+        return results
+
+    # ── Synchronous Claude call (runs in thread pool) ─────────────────────────
 
     def _run_analysis(
         self,
@@ -266,149 +368,134 @@ class AIAnalyzer:
         rsi_14: float,
         whale_direction: str,
         news_sentiment: str,
+        news_summary: str,
         topic_keywords: str,
+        model: str,
     ) -> Optional[dict]:
-        """Synchronous Claude API call with web search."""
+        """
+        Synchronous Claude API call with web search.
+
+        Token estimation:
+            est = len(prompt) / 4
+            If est > 20 000: truncate description → 500 chars, news_summary → 300 chars.
+
+        429 handling:
+            On RateLimitError: sleep 60 s, retry up to 2 times.
+            If still failing after retries: return None (market skipped).
+        """
         client = self._get_client()
         self._last_call_ts = now_ts()
         self._total_calls += 1
 
-        prompt = AI_ANALYSIS_PROMPT.format(
-            question=question,
-            current_price=current_price,
-            current_price_pct=current_price,
-            days_to_resolution=days_to_resolution,
-            category=category,
-            description=description[:600],
-            resolution_source=resolution_source,
-            volume_24h=volume_24h,
-            liquidity=liquidity,
-            price_change_24h=price_change_24h,
-            rsi_14=rsi_14,
-            whale_direction=whale_direction,
-            news_sentiment=news_sentiment,
-            topic_keywords=topic_keywords,
-        )
-
-        try:
-            response = client.messages.create(
-                model="claude-opus-4-5",
-                max_tokens=3000,
-                system=AI_SYSTEM_PROMPT,
-                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
-                messages=[{"role": "user", "content": prompt}],
+        def _build_prompt(desc: str, ns: str) -> str:
+            return AI_ANALYSIS_PROMPT.format(
+                question=question,
+                current_price=current_price,
+                days_to_resolution=days_to_resolution,
+                category=category,
+                description=desc,
+                resolution_source=resolution_source,
+                volume_24h=volume_24h,
+                liquidity=liquidity,
+                price_change_24h=price_change_24h,
+                rsi_14=rsi_14,
+                whale_direction=whale_direction,
+                news_sentiment=news_sentiment,
+                news_summary=ns,
+                topic_keywords=topic_keywords,
             )
-        except anthropic.APIError as e:
-            err_str = str(e).lower()
-            if any(kw in err_str for kw in ("credit", "billing", "balance", "payment", "quota", "overdue")):
-                logger.warning("Anthropic billing/credit error — skipping AI analysis: %s", e)
-            else:
-                logger.error("Anthropic API error: %s", e)
+
+        # Build initial prompt
+        prompt = _build_prompt(description, news_summary)
+
+        # Token estimation — truncate if needed
+        est_tokens = len(prompt) // 4
+        if est_tokens > _TOKEN_LIMIT:
+            logger.debug(
+                "Prompt est. %d tokens > %d — truncating description and news_summary",
+                est_tokens, _TOKEN_LIMIT,
+            )
+            prompt = _build_prompt(description[:500], news_summary[:300])
+
+        # API call with 429 retry loop
+        response = None
+        for attempt in range(_MAX_429_RETRIES + 1):
+            try:
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=1000,
+                    system=AI_SYSTEM_PROMPT,
+                    tools=[{
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "max_uses": 6,
+                    }],
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                break   # success
+
+            except anthropic.RateLimitError:
+                if attempt < _MAX_429_RETRIES:
+                    logger.warning(
+                        "Rate limited (429) — waiting %ds before retry %d/%d",
+                        _RETRY_429_WAIT, attempt + 1, _MAX_429_RETRIES,
+                    )
+                    time.sleep(_RETRY_429_WAIT)
+                else:
+                    logger.warning(
+                        "Rate limited (429) after %d retries — skipping market",
+                        _MAX_429_RETRIES,
+                    )
+                    self._call_errors += 1
+                    return None
+
+            except anthropic.APIError as e:
+                err_str = str(e).lower()
+                billing_kws = ("credit", "billing", "balance", "payment", "quota", "overdue")
+                if any(kw in err_str for kw in billing_kws):
+                    logger.warning("Anthropic billing error — skipping AI analysis: %s", e)
+                else:
+                    logger.error("Anthropic API error: %s", e)
+                self._call_errors += 1
+                return None
+
+        if response is None:
             return None
 
-        # Extract all text blocks
-        text_parts = []
-        for block in response.content:
-            if hasattr(block, "text") and block.text:
-                text_parts.append(block.text)
-            elif hasattr(block, "type") and block.type == "text":
-                text_parts.append(block.text)
-
+        # Collect all text blocks
+        text_parts = [
+            block.text
+            for block in response.content
+            if hasattr(block, "text") and block.text
+        ]
         full_text = "\n".join(text_parts)
         return self._parse_result(full_text, current_price)
 
-    def _parse_result(self, text: str, current_price: float) -> Optional[dict]:
-        """Parse JSON from Claude's response with robust fallback."""
-        # Try direct parse
-        try:
-            data = json.loads(text.strip())
-            return self._validate_result(data, current_price)
-        except json.JSONDecodeError:
-            pass
+    # ── Quick analysis (copy-trade evaluation) ────────────────────────────────
 
-        # Find JSON block
-        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
-                return self._validate_result(data, current_price)
-            except json.JSONDecodeError:
-                pass
-
-        # Last resort: regex extraction
-        prob_match = re.search(r'"yes_probability"\s*:\s*([0-9.]+)', text)
-        conf_match = re.search(r'"confidence"\s*:\s*([0-9.]+)', text)
-        if prob_match:
-            prob = float(prob_match.group(1))
-            conf = float(conf_match.group(1)) if conf_match else 0.4
-            return self._validate_result({
-                "yes_probability": prob,
-                "confidence": conf,
-                "recommended_outcome": "YES" if prob > 0.5 else "NO",
-                "reasoning": "Extracted from partial response.",
-                "resolution_risk": "HIGH",
-            }, current_price)
-
-        logger.warning("Could not parse AI analysis response")
-        return None
-
-    def _validate_result(self, data: dict, current_price: float) -> dict:
-        """Validate and clamp all numeric fields."""
-        data["yes_probability"] = clamp(float(data.get("yes_probability", 0.5)), 0.01, 0.99)
-        data["confidence"] = clamp(float(data.get("confidence", 0.5)), 0.0, 1.0)
-        data["base_rate"] = clamp(float(data.get("base_rate", 0.5)), 0.0, 1.0)
-
-        low = data.get("confidence_interval_low")
-        high = data.get("confidence_interval_high")
-        p = data["yes_probability"]
-        data["confidence_interval_low"] = clamp(float(low) if low else max(0.01, p - 0.15), 0.01, 0.99)
-        data["confidence_interval_high"] = clamp(float(high) if high else min(0.99, p + 0.15), 0.01, 0.99)
-
-        # Ensure recommended_outcome is set
-        if "recommended_outcome" not in data:
-            edge = data["yes_probability"] - current_price
-            if abs(edge) < 0.04:
-                data["recommended_outcome"] = "SKIP"
-            elif edge > 0:
-                data["recommended_outcome"] = "YES"
-            else:
-                data["recommended_outcome"] = "NO"
-
-        # Ensure required fields
-        data.setdefault("reasoning", "No reasoning provided.")
-        data.setdefault("strongest_yes_evidence", "Not analyzed.")
-        data.setdefault("strongest_no_evidence", "Not analyzed.")
-        data.setdefault("key_facts", [])
-        data.setdefault("key_uncertainties", [])
-        data.setdefault("resolution_risk", "MEDIUM")
-        data.setdefault("aggregator_consensus", None)
-        data.setdefault("news_summary", "")
-        data.setdefault("base_rate_source", "estimated")
-        data.setdefault("evidence_adjustment", 0.0)
-        data.setdefault("search_queries_used", [])
-        return data
-
-    async def _enforce_rate_limit(self) -> None:
-        elapsed = now_ts() - self._last_call_ts
-        if elapsed < self.settings.ai_min_call_interval_seconds:
-            await asyncio.sleep(self.settings.ai_min_call_interval_seconds - elapsed)
-
-    async def run_quick_analysis(self, market: dict, timeout_seconds: float = 15.0) -> Optional[dict]:
+    async def run_quick_analysis(
+        self, market: dict, timeout_seconds: float = 15.0
+    ) -> Optional[dict]:
         """
-        Quick 15-second analysis for copy trade evaluation.
-        Uses fewer searches and simplified prompt.
+        Fast analysis for copy-trade evaluation.
+        Always uses the analysis model (Haiku); 1–2 searches; 300 tokens.
         """
-        question = market.get("question", "")
-        current_price = float((market.get("outcomePrices") or [0.5])[0]
-                               if isinstance(market.get("outcomePrices"), list) else 0.5)
+        question      = market.get("question", "")
+        raw_prices    = market.get("outcomePrices", [0.5])
+        current_price = float(
+            raw_prices[0] if isinstance(raw_prices, list) and raw_prices else 0.5
+        )
         slug = market.get("slug") or market.get("conditionId", "")
 
         await self._enforce_rate_limit()
 
-        quick_prompt = f"""Quick analysis for: {question}
-Current market price: {current_price:.1%}
-Search for current evidence (1-2 searches max) and return JSON:
-{{"yes_probability": <float>, "confidence": <float>, "recommended_outcome": "YES"|"NO"|"SKIP", "reasoning": "<1 sentence>"}}"""
+        quick_prompt = (
+            f"Quick analysis: {question}\n"
+            f"Market price: {current_price:.1%}\n"
+            "Search 1–2 times, return JSON only:\n"
+            '{"yes_probability": <float>, "confidence": <float>, '
+            '"recommended_outcome": "YES"|"NO"|"SKIP", "reasoning": "<1 sentence>"}'
+        )
 
         try:
             result = await asyncio.wait_for(
@@ -433,46 +520,164 @@ Search for current evidence (1-2 searches max) and return JSON:
         self._total_calls += 1
         try:
             response = client.messages.create(
-                model="claude-opus-4-5",
-                max_tokens=500,
+                model=self.settings.ai_model_analysis,
+                max_tokens=300,
                 tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
                 messages=[{"role": "user", "content": prompt}],
             )
-            text = ""
-            for block in response.content:
-                if hasattr(block, "text") and block.text:
-                    text += block.text
+            text = "".join(
+                block.text
+                for block in response.content
+                if hasattr(block, "text") and block.text
+            )
             return self._parse_result(text, 0.5)
+        except anthropic.RateLimitError:
+            logger.warning("Quick analysis rate limited (429) — skipping")
+            return None
         except Exception as e:
             logger.debug("Quick analysis error: %s", e)
             return None
 
-    def stats(self) -> dict:
-        return {
-            "total_calls": self._total_calls,
-            "errors": self._call_errors,
-            "success_rate": (self._total_calls - self._call_errors) / max(self._total_calls, 1),
-        }
+    # ── Response parsing ──────────────────────────────────────────────────────
 
-    async def analyze_batch(
-        self,
-        markets: list[dict],
-        max_markets: int = 20,
-        technical_signals: Optional[dict] = None,
-        whale_consensuses: Optional[dict] = None,
-        news_results: Optional[dict] = None,
-    ) -> dict[str, Optional[AIAnalysisResult]]:
-        """Analyze multiple markets. Returns slug → AIAnalysisResult."""
-        results: dict[str, Optional[AIAnalysisResult]] = {}
-        for market in markets[:max_markets]:
-            slug = market.get("slug") or market.get("conditionId", "unknown")
-            tech = technical_signals.get(slug) if technical_signals else None
-            whale = whale_consensuses.get(slug) if whale_consensuses else None
-            news = news_results.get(slug) if news_results else None
+    def _parse_result(self, text: str, current_price: float) -> Optional[dict]:
+        """Parse JSON from Claude's response with three-level fallback."""
+        # Attempt 1: full text is valid JSON
+        try:
+            return self._validate_result(json.loads(text.strip()), current_price)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Attempt 2: brace-depth scan for outermost {...}
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start != -1:
+                    try:
+                        return self._validate_result(
+                            json.loads(text[start:i + 1]), current_price
+                        )
+                    except (json.JSONDecodeError, ValueError):
+                        break
+
+        # Attempt 3: regex for nested objects
+        m = re.search(r'\{[\s\S]*\}', text)
+        if m:
             try:
-                result = await self.analyze_market(market, tech, whale, news)
-                results[slug] = result
-            except Exception as e:
-                logger.warning("AI analysis error for %s: %s", slug, e)
-                results[slug] = None
-        return results
+                return self._validate_result(json.loads(m.group()), current_price)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Attempt 4: field-level extraction as last resort
+        prob_m = re.search(r'"yes_probability"\s*:\s*([0-9.]+)', text)
+        conf_m = re.search(r'"confidence"\s*:\s*([0-9.]+)', text)
+        if prob_m:
+            return self._validate_result({
+                "yes_probability":   float(prob_m.group(1)),
+                "confidence":        float(conf_m.group(1)) if conf_m else 0.4,
+                "recommended_outcome": "SKIP",
+                "reasoning":         "Extracted from partial response.",
+                "resolution_risk":   "HIGH",
+            }, current_price)
+
+        logger.warning("Could not parse AI analysis response")
+        return None
+
+    def _validate_result(self, data: dict, current_price: float) -> dict:
+        """Validate and clamp all numeric fields; fill required defaults."""
+        data["yes_probability"] = clamp(float(data.get("yes_probability", 0.5)), 0.01, 0.99)
+        data["confidence"]      = clamp(float(data.get("confidence", 0.5)), 0.0, 1.0)
+        data["base_rate"]       = clamp(float(data.get("base_rate", 0.5)), 0.0, 1.0)
+
+        p    = data["yes_probability"]
+        low  = data.get("confidence_interval_low")
+        high = data.get("confidence_interval_high")
+        data["confidence_interval_low"]  = clamp(float(low)  if low  else max(0.01, p - 0.15), 0.01, 0.99)
+        data["confidence_interval_high"] = clamp(float(high) if high else min(0.99, p + 0.15), 0.01, 0.99)
+
+        if "recommended_outcome" not in data:
+            edge = data["yes_probability"] - current_price
+            if abs(edge) < 0.04:
+                data["recommended_outcome"] = "SKIP"
+            elif edge > 0:
+                data["recommended_outcome"] = "YES"
+            else:
+                data["recommended_outcome"] = "NO"
+
+        data.setdefault("reasoning",              "No reasoning provided.")
+        data.setdefault("strongest_yes_evidence", "Not analyzed.")
+        data.setdefault("strongest_no_evidence",  "Not analyzed.")
+        data.setdefault("key_facts",              [])
+        data.setdefault("key_uncertainties",      [])
+        data.setdefault("resolution_risk",        "MEDIUM")
+        data.setdefault("aggregator_consensus",   None)
+        data.setdefault("news_summary",           "")
+        data.setdefault("base_rate_source",       "estimated")
+        data.setdefault("evidence_adjustment",    0.0)
+        data.setdefault("search_queries_used",    [])
+        return data
+
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+
+    async def _enforce_rate_limit(self) -> None:
+        """
+        Two-layer rate limiting before every API call:
+
+        Layer 1 — per-minute window:
+            Track call timestamps in a sliding 60-second deque.
+            If the window is full (>= ai_max_calls_per_minute), sleep until
+            the oldest call expires from the window.
+
+        Layer 2 — minimum interval:
+            Ensure at least ai_min_call_interval_seconds have elapsed since
+            the last call, regardless of the window.
+        """
+        window = 60.0
+        max_calls = self.settings.ai_max_calls_per_minute
+
+        # Layer 1: per-minute window cap
+        while True:
+            now = now_ts()
+            # Prune timestamps outside the window
+            while self._call_timestamps and now - self._call_timestamps[0] > window:
+                self._call_timestamps.popleft()
+
+            if len(self._call_timestamps) < max_calls:
+                break   # window has capacity
+
+            oldest    = self._call_timestamps[0]
+            sleep_secs = window - (now - oldest) + 0.5   # small buffer
+            if sleep_secs > 0:
+                logger.info(
+                    "Rate limit window full (%d calls in 60s) — sleeping %.1fs",
+                    len(self._call_timestamps), sleep_secs,
+                )
+                await asyncio.sleep(sleep_secs)
+
+        # Layer 2: minimum interval between consecutive calls
+        elapsed = now_ts() - self._last_call_ts
+        gap     = self.settings.ai_min_call_interval_seconds
+        if elapsed < gap:
+            await asyncio.sleep(gap - elapsed)
+
+        # Record this call in the window
+        self._call_timestamps.append(now_ts())
+
+    # ── Stats ─────────────────────────────────────────────────────────────────
+
+    def stats(self) -> dict:
+        now = now_ts()
+        recent = sum(1 for ts in self._call_timestamps if now - ts <= 60.0)
+        return {
+            "total_calls":      self._total_calls,
+            "errors":           self._call_errors,
+            "success_rate":     (self._total_calls - self._call_errors) / max(self._total_calls, 1),
+            "calls_last_60s":   recent,
+            "window_remaining": max(0, self.settings.ai_max_calls_per_minute - recent),
+        }
