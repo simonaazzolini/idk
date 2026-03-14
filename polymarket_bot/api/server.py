@@ -113,10 +113,11 @@ class APIServer:
     Provides all REST and WebSocket endpoints for the dashboard.
     """
 
-    def __init__(self, settings, db_path: str = "polymarket_bot.db", bot_ref=None):
+    def __init__(self, settings, db_path: str = "polymarket_bot.db", bot_ref=None, process_manager=None):
         self.settings = settings
         self.db_path = db_path
         self.bot_ref = bot_ref
+        self.process_manager = process_manager  # BotProcessManager when running standalone
         self.mgr = ConnectionManager()
         self._start_ts: float = time.time()
         self._server_task: Optional[asyncio.Task] = None
@@ -308,10 +309,15 @@ class APIServer:
             criteria_passing = sum(1 for c in criteria.values() if c["pass"])
 
             bot_running = bool(bot and getattr(bot, "_running", False))
+            pm = server_self.process_manager
+            if pm:
+                bot_running = pm.is_running
 
             return {
                 "mode": stored_mode,
                 "bot_running": bot_running,
+                "bot_process_running": pm.is_running if pm else None,
+                "bot_pid": pm._proc.pid if (pm and pm.is_running) else None,
                 "runtime_seconds": runtime,
                 "paper_hours_remaining": round(paper_remaining, 2),
                 "paper_progress_pct": round(paper_progress, 2),
@@ -798,24 +804,58 @@ class APIServer:
             body = await request.json()
             action = body.get("action", "")
             bot = server_self.bot_ref
+            pm  = server_self.process_manager
 
-            if action == "pause":
+            # ── Start (subprocess mode only) ──────────────────────────────────
+            if action == "start":
+                if pm:
+                    mode   = body.get("mode", "paper")
+                    budget = body.get("budget") or None
+                    result = await pm.start(mode=mode, budget=budget)
+                    if result["success"]:
+                        await _execute(db, "INSERT OR REPLACE INTO bot_state(key,value) VALUES('mode',?)",
+                                       (mode.upper(),))
+                        await mgr.broadcast("mode_change", {"old_mode": "STOPPED", "new_mode": mode.upper()})
+                    return result
+                if bot:
+                    return {"success": False, "message": "Bot is already running"}
+                return {"success": False, "message": "No process manager available"}
+
+            # ── Pause ─────────────────────────────────────────────────────────
+            elif action == "pause":
+                # Write to DB; running bot polls DB in its fast loop
+                await _execute(db, "INSERT OR REPLACE INTO bot_state(key,value) VALUES('mode','PAUSED')")
                 if bot:
                     bot._running = False
-                await _execute(db, "INSERT OR REPLACE INTO bot_state(key,value) VALUES('mode','PAUSED')")
-                return {"success": True, "message": "Bot paused"}
+                return {"success": True, "message": "Pause signal sent"}
 
+            # ── Resume ────────────────────────────────────────────────────────
             elif action == "resume":
+                if pm and not pm.is_running:
+                    # Process exited; restart it in whatever mode was last active
+                    stored = await _scalar(db, "SELECT value FROM bot_state WHERE key='mode'") or "PAPER"
+                    restart_mode = "paper" if stored in ("PAUSED", "STOPPED", "PAPER") else "live"
+                    result = await pm.start(mode=restart_mode)
+                    if result["success"]:
+                        await _execute(db, "INSERT OR REPLACE INTO bot_state(key,value) VALUES('mode',?)",
+                                       (restart_mode.upper(),))
+                    return result
+                # Process running (paused via DB): restore previous mode
+                stored = await _scalar(db, "SELECT value FROM bot_state WHERE key='prev_mode'") or "PAPER"
+                await _execute(db, f"INSERT OR REPLACE INTO bot_state(key,value) VALUES('mode','{stored}')")
                 if bot:
                     bot._running = True
                     asyncio.create_task(bot.run())
-                return {"success": True, "message": "Bot resumed"}
+                return {"success": True, "message": "Resume signal sent"}
 
+            # ── Stop ──────────────────────────────────────────────────────────
             elif action == "stop":
+                await _execute(db, "INSERT OR REPLACE INTO bot_state(key,value) VALUES('mode','STOPPED')")
+                if pm and pm.is_running:
+                    return await pm.stop()
                 if bot:
                     bot._running = False
-                await _execute(db, "INSERT OR REPLACE INTO bot_state(key,value) VALUES('mode','STOPPED')")
-                return {"success": True, "message": "Bot stopped"}
+                return {"success": True, "message": "Stop signal sent"}
 
             elif action == "restart_cycle":
                 if bot:

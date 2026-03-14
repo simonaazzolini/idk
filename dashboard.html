@@ -305,6 +305,8 @@
         <div class="card">
           <h3>Bot Status</h3>
           <div style="display:flex;flex-direction:column;gap:8px;font-size:13px">
+            <div style="display:flex;justify-content:space-between"><span class="dim">Process</span><span id="st-process">—</span></div>
+            <div style="display:flex;justify-content:space-between"><span class="dim">PID</span><span id="st-pid" class="mono dim">—</span></div>
             <div style="display:flex;justify-content:space-between"><span class="dim">Mode</span><span id="st-mode">—</span></div>
             <div style="display:flex;justify-content:space-between"><span class="dim">Runtime</span><span id="st-runtime">—</span></div>
             <div style="display:flex;justify-content:space-between"><span class="dim">Last Cycle</span><span id="st-last-cycle">—</span></div>
@@ -511,7 +513,8 @@
       <div class="card">
         <h3>Bot Controls</h3>
         <div class="btn-group">
-          <button class="btn btn-success" id="ctrl-start">▶ Start</button>
+          <button class="btn btn-success" id="ctrl-start-paper">▶ Start (Paper)</button>
+          <button class="btn btn-success" id="ctrl-start-live">▶ Start (Live)</button>
           <button class="btn btn-success" id="ctrl-resume">↺ Resume</button>
           <button class="btn btn-warn"    id="ctrl-pause">⏸ Pause</button>
           <button class="btn btn-danger"  id="ctrl-stop">⏹ Stop</button>
@@ -951,6 +954,17 @@ async function loadOverview() {
   mb.className = 'mode-' + mode;
 
   // Bot status
+  // Process status (populated by standalone server.py)
+  if (status.bot_process_running != null) {
+    $('st-process').innerHTML = status.bot_process_running
+      ? '<span class="green">● Running</span>'
+      : '<span class="red">● Stopped</span>';
+    $('st-pid').textContent = status.bot_pid ?? '—';
+  } else {
+    $('st-process').innerHTML = '<span class="dim">embedded</span>';
+    $('st-pid').textContent = '—';
+  }
+
   $('st-mode').innerHTML = modeBadge(mode);
   $('st-runtime').textContent = fmtRuntime(status.runtime_seconds);
   $('st-last-cycle').textContent = timeAgo(status.last_cycle_at);
@@ -1201,7 +1215,22 @@ async function ctrl(action, extra={}) {
   else toast(res?.detail || 'Action failed', 'error');
 }
 
-$('ctrl-start').onclick  = () => ctrl('resume');   // resume acts as start when stopped
+async function startBot(mode) {
+  const ok = await showModal(
+    `▶ Start Bot (${mode.toUpperCase()})`,
+    mode === 'live'
+      ? 'Start the bot in LIVE mode with real money?'
+      : 'Start the bot in paper trading mode?',
+    { confirmClass: mode === 'live' ? 'btn-danger' : 'btn-success' }
+  );
+  if (!ok) return;
+  const budget = parseFloat($('settings-form')?.elements['budget']?.value) || undefined;
+  const res = await apiPost('/api/control', { action: 'start', mode, budget });
+  if (res?.success) { toast(res.message || 'Bot starting…', 'success'); setTimeout(refreshAll, 1500); }
+  else toast(res?.message || 'Start failed', 'error');
+}
+$('ctrl-start-paper').onclick = () => startBot('paper');
+$('ctrl-start-live').onclick  = () => startBot('live');
 $('ctrl-resume').onclick = () => ctrl('resume');
 $('ctrl-pause').onclick  = () => ctrl('pause');
 $('ctrl-stop').onclick   = async () => {

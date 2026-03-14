@@ -138,6 +138,9 @@ class PolymarketBot:
 
         try:
             while self._running:
+                await self._check_db_commands()
+                if not self._running:
+                    break
                 cycle_start = now_ts()
                 try:
                     await self._main_cycle()
@@ -608,6 +611,10 @@ class PolymarketBot:
             try:
                 await asyncio.sleep(300)  # 5 minutes
 
+                await self._check_db_commands()
+                if not self._running:
+                    break
+
                 # a. WebSocket health check
                 if self.client.ws:
                     self.dashboard.ws_connected = self.client.ws.is_connected
@@ -839,25 +846,58 @@ class PolymarketBot:
                 self.dashboard.print_diagnostic_report(self._generate_diagnostic())
 
     async def _prompt_for_live_trading(self) -> None:
-        """Wait for user to type CONFIRM LIVE TRADING."""
-        import sys
-        self.dashboard.stop()
-        print("\nType 'CONFIRM LIVE TRADING' to activate live mode, or Ctrl+C to continue paper trading:\n")
+        """Signal the dashboard that GO criteria are met; wait for UI confirmation.
+
+        The standalone server polls bot_state['paper_eval_go'] and broadcasts
+        the paper_evaluation WebSocket event, which auto-opens the confirmation
+        modal in the dashboard.  The user types the phrase there; the dashboard
+        calls POST /api/control action=activate_live which writes mode=LIVE to
+        the DB.  _check_db_commands() picks that up on the next fast-loop tick.
+        """
+        logger.info(
+            "Paper trading COMPLETE — GO criteria met! "
+            "Open the dashboard and confirm live trading there."
+        )
+        await self.db.set_state("paper_eval_go", "1")
+        # Continue paper trading until the dashboard writes mode=LIVE to DB.
+
+    async def _check_db_commands(self) -> None:
+        """Poll DB for mode changes written by the dashboard server."""
+        if not self._running:
+            return
         try:
-            user_input = await asyncio.get_event_loop().run_in_executor(None, input, "> ")
-            if user_input.strip() == "CONFIRM LIVE TRADING":
+            db_mode = await self.db.get_state("mode")
+            if not db_mode or db_mode == self.mode:
+                return
+
+            if db_mode == "STOPPED":
+                logger.info("Stop command received via dashboard")
+                self._running = False
+
+            elif db_mode == "PAUSED" and self.mode not in ("PAUSED", "STOPPED"):
+                logger.info("Pause command received via dashboard")
+                await self.db.set_state("prev_mode", self.mode)
+                self.mode = "PAUSED"
+                # Block here until the DB mode changes away from PAUSED
+                while self._running:
+                    await asyncio.sleep(5)
+                    db_mode = await self.db.get_state("mode")
+                    if db_mode == "STOPPED":
+                        self._running = False
+                        break
+                    if db_mode != "PAUSED":
+                        self.mode = db_mode
+                        logger.info("Resumed, mode=%s", self.mode)
+                        break
+
+            elif db_mode == "LIVE" and self.mode in ("PAPER", "PAUSED"):
+                logger.info("Live mode activated via dashboard")
                 self.mode = "LIVE"
                 self.portfolio.state.mode = "LIVE"
-                await self.db.set_state("mode", "LIVE")
                 await self.db.set_state("live_activated_at", str(now_ts()))
-                logger.info("LIVE TRADING ACTIVATED by user confirmation")
-                print("\n[LIVE MODE ACTIVATED]\n")
-            else:
-                print("Live mode not activated. Continuing paper trading.")
-        except (EOFError, KeyboardInterrupt):
-            print("\nContinuing paper trading.")
-        finally:
-            self.dashboard.start()
+
+        except Exception as exc:
+            logger.debug("_check_db_commands error: %s", exc)
 
     def _generate_diagnostic(self) -> dict:
         """Generate tuning suggestions after 7-day no-go."""
