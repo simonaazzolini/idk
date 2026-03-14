@@ -101,11 +101,14 @@ class DataClient:
             return await resp.json(content_type=None)
 
     async def get_leaderboard(self, window: str = "all", limit: int = 100) -> list[dict]:
-        data = await self._get("/leaderboard", {"window": window, "limit": limit})
+        data = await self._get("/leaderboard", {"window": window, "limit": limit, "sort": "profit"})
+        logger.debug("Leaderboard raw response (window=%s): %s", window, str(data)[:500])
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            return data.get("data", data.get("leaderboard", []))
+            for key in ("data", "results", "leaderboard"):
+                if key in data and isinstance(data[key], list):
+                    return data[key]
         return []
 
     async def get_trades(
@@ -114,12 +117,15 @@ class DataClient:
         market: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
+        min_size: Optional[float] = None,
     ) -> list[dict]:
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if maker_address:
             params["maker_address"] = maker_address
         if market:
             params["market"] = market
+        if min_size is not None:
+            params["minSize"] = min_size
         data = await self._get("/trades", params)
         if isinstance(data, list):
             return data
@@ -626,7 +632,7 @@ class PolymarketClient:
             self._ws_task = asyncio.create_task(self.ws.start(), name="ws_listener")
             logger.info("WebSocket task started")
 
-    async def shutdown(self) -> None:
+    async def shutdown(self, mode: str = "LIVE") -> None:
         """Gracefully shut down all connections."""
         if self.ws:
             await self.ws.stop()
@@ -636,11 +642,13 @@ class PolymarketClient:
                 await self._ws_task
             except asyncio.CancelledError:
                 pass
-        if self.clob:
+        if self.clob and mode == "LIVE":
             try:
                 await self.clob.cancel_all_orders()
             except Exception:
                 pass
+        elif self.clob:
+            logger.info("Paper mode: skipping cancel_all_orders on shutdown")
         if self._session:
             await self._session.close()
         logger.info("PolymarketClient shut down")

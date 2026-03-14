@@ -63,18 +63,53 @@ class WhaleTracker:
         """Full sweep: leaderboard → trade history → compute metrics → classify."""
         logger.info("Starting full whale wallet database refresh...")
 
-        # 1. Collect wallets from all leaderboard windows
+        # 1. Collect wallets from leaderboard — try windows in order, stop on first hit
         wallets: set[str] = set()
-        for window in ["all", "30d", "7d", "1d"]:
+        for window in ["all", "1m", "7d", "1d"]:
             try:
                 board = await self.client.data.get_leaderboard(window=window, limit=100)
+                logger.debug("Leaderboard raw response (window=%s): %s", window, str(board)[:500])
                 for entry in board:
-                    addr = entry.get("proxyWallet") or entry.get("address") or entry.get("wallet")
+                    addr = (
+                        entry.get("proxyWallet")
+                        or entry.get("proxy_address")
+                        or entry.get("address")
+                        or entry.get("user")
+                        or entry.get("wallet")
+                        or entry.get("account")
+                    )
                     if addr:
                         wallets.add(str(addr).lower())
+                if wallets:
+                    logger.info(
+                        "Leaderboard window=%s returned %d entries → %d wallets",
+                        window, len(board), len(wallets),
+                    )
+                    break  # stop at first window that yields results
+                logger.debug("Leaderboard window=%s returned 0 usable entries, trying next", window)
             except Exception as e:
                 logger.warning("Leaderboard fetch failed for window=%s: %s", window, e)
             await asyncio.sleep(0.5)
+
+        # 2. Fall back to recent large trades if leaderboard yielded nothing
+        if not wallets:
+            logger.warning(
+                "Leaderboard returned 0 wallets across all windows — "
+                "seeding from recent large trades (minSize=1000)"
+            )
+            try:
+                trades = await self.client.data.get_trades(limit=500, min_size=1000)
+                for trade in trades:
+                    for field in ("maker_address", "taker_address", "maker", "taker"):
+                        addr = trade.get(field)
+                        if addr:
+                            wallets.add(str(addr).lower())
+                logger.info(
+                    "Leaderboard empty, seeding from recent large trades: %d wallets found",
+                    len(wallets),
+                )
+            except Exception as e:
+                logger.warning("Trade-based wallet fallback also failed: %s", e)
 
         logger.info("Collected %d unique wallets from leaderboards", len(wallets))
 

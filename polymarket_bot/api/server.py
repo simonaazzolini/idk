@@ -869,7 +869,10 @@ class APIServer:
 
             elif action == "cancel_all_orders":
                 if bot and bot.client and bot.client.clob:
-                    await bot.client.clob.cancel_all_orders()
+                    if bot.mode == "LIVE":
+                        await bot.client.clob.cancel_all_orders()
+                    else:
+                        logger.info("Paper mode: skipping real cancel_all_orders from dashboard")
                 return {"success": True, "message": "All orders cancelled"}
 
             elif action == "close_all_positions":

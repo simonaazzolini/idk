@@ -406,7 +406,7 @@ async def main() -> None:
         _logger.info("Shutdown signal received")
     finally:
         loop.remove_signal_handler(signal.SIGTERM)
-        await client.shutdown()
+        await client.shutdown(mode=bot.mode)
         _logger.info("Bot stopped.")
 
 
