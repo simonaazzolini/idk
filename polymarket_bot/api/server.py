@@ -940,3 +940,10 @@ class APIServer:
                 mgr.disconnect(ws)
             except Exception:
                 mgr.disconnect(ws)
+
+
+# ── Module-level app for direct uvicorn invocation ────────────────────────────
+# Allows:  uvicorn polymarket_bot.api.server:app --host 0.0.0.0 --port 8765
+# Routes are registered with settings=None; all handlers guard against it.
+_default_server = APIServer(settings=None)
+app = _default_server.app
