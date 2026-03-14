@@ -411,7 +411,7 @@ class PolymarketWebSocket:
     Auto-reconnects with exponential backoff.
     """
 
-    WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+    WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
     def __init__(self, settings: Settings):
         self._settings = settings
@@ -438,8 +438,7 @@ class PolymarketWebSocket:
         self._subscribed_tokens.update(token_ids)
         if self._connected and new_tokens and self._ws:
             msg = json.dumps({
-                "type": "subscribe",
-                "channel": "market",
+                "type": "Market",
                 "assets_ids": list(new_tokens),
             })
             try:
@@ -467,8 +466,9 @@ class PolymarketWebSocket:
                 await asyncio.sleep(delay)
 
     async def _connect_and_listen(self) -> None:
+        ws_url = getattr(self._settings, "ws_url", self.WS_URL)
         async with websockets.connect(
-            self.WS_URL,
+            ws_url,
             ping_interval=20,
             ping_timeout=20,
             close_timeout=5,
@@ -476,13 +476,12 @@ class PolymarketWebSocket:
             self._ws = ws
             self._connected = True
             self._reconnect_attempt = 0
-            logger.info("WebSocket connected to %s", self.WS_URL)
+            logger.info("WebSocket connected to %s", ws_url)
 
             # Subscribe to all tracked tokens
             if self._subscribed_tokens:
                 sub_msg = json.dumps({
-                    "type": "subscribe",
-                    "channel": "market",
+                    "type": "Market",
                     "assets_ids": list(self._subscribed_tokens),
                 })
                 await ws.send(sub_msg)

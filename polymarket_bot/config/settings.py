@@ -31,7 +31,7 @@ class Settings:
     clob_url: str = "https://clob.polymarket.com"
     gamma_url: str = "https://gamma-api.polymarket.com"
     data_url: str = "https://data-api.polymarket.com"
-    ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+    ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     chain_id: int = 137
 
     # ── Trading Parameters ────────────────────────────────────────────────────
