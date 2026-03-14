@@ -511,7 +511,8 @@
       <div class="card">
         <h3>Bot Controls</h3>
         <div class="btn-group">
-          <button class="btn btn-success" id="ctrl-resume">▶ Resume</button>
+          <button class="btn btn-success" id="ctrl-start">▶ Start</button>
+          <button class="btn btn-success" id="ctrl-resume">↺ Resume</button>
           <button class="btn btn-warn"    id="ctrl-pause">⏸ Pause</button>
           <button class="btn btn-danger"  id="ctrl-stop">⏹ Stop</button>
           <button class="btn"             id="ctrl-cycle">↻ Restart Cycle</button>
@@ -779,7 +780,14 @@ function handleWsMessage(msg) {
       refreshAll();
       break;
     case 'paper_evaluation':
-      addEvent('info', `Paper eval: ${data.go ? '✅ GO' : '❌ NO-GO'}`);
+      if (data.go) {
+        addEvent('info', '✅ Paper eval: GO — live trading confirmation required');
+        toast('Paper period complete — bot is ready for live trading!', 'warn', 8000);
+        promptActivateLive({ fromBot: true });
+      } else {
+        addEvent('info', '❌ Paper eval: NO-GO — continuing paper trading');
+        toast('Paper eval: NO-GO. Continuing paper trading.', 'info', 5000);
+      }
       break;
   }
 }
@@ -1193,13 +1201,14 @@ async function ctrl(action, extra={}) {
   else toast(res?.detail || 'Action failed', 'error');
 }
 
+$('ctrl-start').onclick  = () => ctrl('resume');   // resume acts as start when stopped
 $('ctrl-resume').onclick = () => ctrl('resume');
 $('ctrl-pause').onclick  = () => ctrl('pause');
 $('ctrl-stop').onclick   = async () => {
   const ok = await showModal('Stop Bot', 'Are you sure you want to stop the bot?');
   if (ok) ctrl('stop');
 };
-$('ctrl-cycle').onclick        = () => ctrl('restart_cycle');
+$('ctrl-cycle').onclick         = () => ctrl('restart_cycle');
 $('ctrl-cancel-orders').onclick = async () => {
   const ok = await showModal('Cancel Orders', 'Cancel all open orders?');
   if (ok) ctrl('cancel_all_orders');
@@ -1212,19 +1221,25 @@ $('ctrl-reset-paper').onclick  = async () => {
   const ok = await showModal('Reset Paper', 'Reset the 48-hour paper trading period?');
   if (ok) ctrl('reset_paper');
 };
-$('ctrl-go-live').onclick      = async () => {
-  const phrase = await showModal(
-    '⚡ Activate Live Trading',
-    'This will switch to REAL trading with REAL money. Type the confirmation phrase exactly to proceed.',
-    { needInput: true, placeholder: 'CONFIRM LIVE TRADING', confirmClass: 'btn-danger' }
-  );
-  if (phrase === true || !phrase) return;  // modal closed without input
-  if (typeof phrase === 'string' && phrase.trim() === 'CONFIRM LIVE TRADING') {
+
+// Shared live-activation prompt — called by button AND by paper_evaluation WS event
+async function promptActivateLive({ fromBot = false } = {}) {
+  const desc = fromBot
+    ? 'The bot has completed paper trading and is ready to go live. ' +
+      'Type the confirmation phrase to switch to REAL trading with REAL money.'
+    : 'This will switch to REAL trading with REAL money. ' +
+      'Type the confirmation phrase exactly to proceed.';
+  const phrase = await showModal('⚡ Activate Live Trading', desc,
+    { needInput: true, placeholder: 'CONFIRM LIVE TRADING', confirmClass: 'btn-danger' });
+  if (!phrase || phrase === true) return;
+  if (phrase.trim() === 'CONFIRM LIVE TRADING') {
     ctrl('activate_live', { confirm_phrase: 'CONFIRM LIVE TRADING' });
   } else {
     toast('Invalid confirmation phrase', 'error');
   }
-};
+}
+
+$('ctrl-go-live').onclick = () => promptActivateLive();
 
 // Settings form
 $('settings-form').onsubmit = async (e) => {
