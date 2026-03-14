@@ -7,6 +7,8 @@ __pycache__/
 
 # Credentials — never commit
 config/.env
+polymarket_bot/config/.env
+**/.env
 
 # Runtime artifacts
 polymarket_bot/*.db
