@@ -210,20 +210,38 @@ class WhaleTracker:
             await asyncio.sleep(0.5)
 
         self._last_full_refresh = now_ts()
-        logger.info("Full whale refresh complete. Tracked %d wallets.", total)
+        # Count how many made it to the DB (all of them now, including stubs)
+        db_count = len(await self.db.get_all_tracked_wallets())
+        enriched = sum(
+            1 for w in self._wallet_cache.values()
+            if w.get("tier_tags") not in ('["UNVERIFIED"]', '[]')
+        )
+        logger.info(
+            "Full whale refresh complete. Discovered=%d  DB=%d  enriched=%d",
+            total, db_count, enriched,
+        )
 
     async def _refresh_single_wallet(self, wallet: str) -> None:
-        """Fetch trades + positions for one wallet, compute metrics, save to DB."""
+        """Fetch trades + positions for one wallet, compute metrics, save to DB.
+
+        Always writes a record to the DB — even when the API returns no trades
+        or positions — so that every discovered address appears in the Whales
+        tab.  Wallets with no activity get empty metrics and a ["UNVERIFIED"]
+        tier tag; they are enriched on the next refresh cycle once data arrives.
+        """
         # Fetch trade history (both maker and taker)
         trades = await self.client.data.get_all_trades_for_wallet(wallet)
         positions = await self.client.data.get_positions(wallet, size_threshold=0.01)
 
-        if not trades and not positions:
-            return
-
-        # Compute metrics
+        # compute_wallet_metrics handles empty lists via _empty_metrics()
         metrics = compute_wallet_metrics(trades, positions)
-        tier_tags = classify_wallet_tiers(metrics)
+
+        if trades or positions:
+            tier_tags = classify_wallet_tiers(metrics)
+        else:
+            # No data yet — mark as unverified so it still appears in the DB
+            # and is re-classified on the next full refresh cycle
+            tier_tags = ["UNVERIFIED"]
 
         wallet_record = {
             "address": wallet,
@@ -233,8 +251,8 @@ class WhaleTracker:
         await self.db.upsert_whale_wallet(wallet_record)
         self._wallet_cache[wallet] = wallet_record
 
-        # Flag insiders for review
-        if metrics.get("insider_score", 0) >= 8.0:
+        # Flag insiders for review (only when we have actual trade evidence)
+        if (trades or positions) and metrics.get("insider_score", 0) >= 8.0:
             await self._flag_insider(wallet, metrics)
 
     async def _flag_insider(self, wallet: str, metrics: dict) -> None:

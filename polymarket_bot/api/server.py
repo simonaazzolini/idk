@@ -608,7 +608,23 @@ class APIServer:
 
         @app.get("/api/whales")
         async def whales():
-            wallets = await _query(db, "SELECT * FROM whale_wallets ORDER BY total_pnl DESC LIMIT 20")
+            # Total count (all tiers, including stubs) so the UI can show
+            # "X wallets tracked" even before enrichment completes.
+            total_tracked = await _scalar(
+                db, "SELECT COUNT(*) FROM whale_wallets"
+            ) or 0
+
+            # Enriched wallets first (have real trade data), then stubs.
+            # Within each group order by insider_score → total_pnl → total_trades.
+            wallets = await _query(db, """
+                SELECT * FROM whale_wallets
+                ORDER BY
+                    CASE WHEN tier_tags NOT IN ('["UNVERIFIED"]', '[]', '') THEN 0 ELSE 1 END,
+                    insider_score DESC,
+                    total_pnl DESC,
+                    total_trades DESC
+                LIMIT 50
+            """)
             now = time.time()
             top_wallets = []
             for w in wallets:
@@ -710,6 +726,7 @@ class APIServer:
                     best_wallet = _short_addr(max(wallet_perf, key=lambda k: sum(wallet_perf[k])))
 
             return {
+                "total_wallets_tracked": int(total_tracked),
                 "top_wallets": top_wallets,
                 "recent_alerts": recent_alerts,
                 "smart_money_consensus": sm_consensus,
