@@ -783,8 +783,22 @@ class PolymarketBot:
                 decision.size_usdc, result.fill_price
             )
 
+    async def _has_open_position(self, market_slug: str) -> bool:
+        """Return True if the bot already holds an open/pending position on this market."""
+        return await self.db.has_open_position(market_slug, self.mode)
+
     async def _execute_signal(self, signal: TradeSignal, markets: list[dict]) -> None:
         """Execute a trade signal after Kelly sizing."""
+        # ── Duplicate-trade guard ─────────────────────────────────────────────
+        # Must be the very first check so no downstream logic (Kelly, order
+        # placement, portfolio update) runs when a position already exists.
+        if await self._has_open_position(signal.market_slug):
+            logger.info(
+                "DUPLICATE SKIP: %s — position already open in mode=%s",
+                signal.market_slug, self.mode,
+            )
+            return
+
         market = next(
             (m for m in markets if m.get("slug") == signal.market_slug
              or m.get("conditionId") == signal.market_slug),

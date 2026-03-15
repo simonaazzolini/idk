@@ -368,6 +368,18 @@ class Database:
             await db.execute(f"UPDATE {table} SET {set_parts} WHERE id=?", vals)
             await db.commit()
 
+    async def has_open_position(self, market_slug: str, mode: str) -> bool:
+        """Return True if there is already an open/pending position for this market."""
+        table = "paper_trades" if mode == "PAPER" else "trades"
+        async with self._get_conn() as db:
+            async with db.execute(
+                f"SELECT COUNT(*) FROM {table} "
+                "WHERE market_slug = ? AND status IN ('OPEN', 'FILLED', 'PENDING')",
+                (market_slug,),
+            ) as cur:
+                row = await cur.fetchone()
+                return bool(row and row[0] > 0)
+
     async def get_open_trades(self, mode: str) -> list[dict]:
         table = "paper_trades" if mode == "PAPER" else "trades"
         async with self._get_conn() as db:
