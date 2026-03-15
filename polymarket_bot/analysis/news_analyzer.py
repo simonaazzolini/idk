@@ -17,6 +17,10 @@ from utils.helpers import clamp, now_ts, safe_div
 logger = logging.getLogger(__name__)
 
 
+class _NewsBillingError(Exception):
+    """Raised internally when Anthropic returns a billing/credit error in news analysis."""
+
+
 NEWS_SYSTEM_PROMPT = """You are an expert news analyst for prediction markets.
 Your task is to research and analyze information relevant to a binary prediction
 market question and synthesize findings into a precise JSON response.
@@ -84,6 +88,11 @@ class NewsAnalyzer:
     Analyzes news and sentiment for prediction markets using Claude with web search.
     Implements all 7 search strategies, computes a full news_score 0–10, and
     handles all failure modes gracefully (no news found, API errors, parse errors).
+
+    Billing / credit handling:
+        - On first billing/credit error: set news_available=False
+        - All subsequent calls return empty_result immediately (no retries)
+        - Flag is reset to True at the start of each new cycle
     """
 
     def __init__(self, settings: Settings, cache: MarketDataCache):
@@ -93,6 +102,14 @@ class NewsAnalyzer:
         self._last_call_ts: float = 0.0
         self._total_calls:  int   = 0
         self._failed_calls: int   = 0
+        # Set to False when a billing error is detected; reset each cycle
+        self.news_available: bool = True
+
+    def reset_for_cycle(self) -> None:
+        """Call at the start of each bot cycle to re-enable news after a billing error."""
+        if not self.news_available:
+            logger.info("News availability flag reset for new cycle — will attempt one call.")
+        self.news_available = True
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -111,6 +128,11 @@ class NewsAnalyzer:
         on any failure so the bot can continue without news signal.
         """
         slug = market.get("slug") or market.get("conditionId", "unknown")
+
+        # Skip immediately if billing error was already hit this cycle
+        if not self.news_available:
+            logger.debug("News unavailable (billing error this cycle) — skipping %s", slug[:30])
+            return self._empty_result()
 
         # ── Cache check ────────────────────────────────────────────────────
         cached = await self.cache.get_news(slug)
@@ -146,6 +168,14 @@ class NewsAnalyzer:
                     days_to_resolution, category, description,
                 ),
             )
+        except _NewsBillingError:
+            self.news_available = False
+            self._failed_calls += 1
+            logger.error(
+                "News analysis disabled for remainder of this cycle (billing/credit error). "
+                "Will retry next cycle."
+            )
+            result = self._empty_result()
         except Exception as e:
             logger.warning("News analysis failed for %s: %s", slug, e)
             self._failed_calls += 1
@@ -235,9 +265,13 @@ class NewsAnalyzer:
             )
         except anthropic.APIError as e:
             err_str = str(e).lower()
-            billing_kws = ("credit", "billing", "balance", "payment", "quota", "overdue")
+            billing_kws = ("credit", "billing", "balance", "payment", "quota",
+                           "overdue", "insufficient", "exceeded")
             if any(kw in err_str for kw in billing_kws):
-                logger.warning("Anthropic billing/credit error — skipping news analysis: %s", e)
+                logger.error(
+                    "Anthropic BILLING/CREDIT error in news — disabling news for this cycle: %s", e
+                )
+                raise _NewsBillingError(str(e)) from e
             else:
                 logger.error("Anthropic API error in news analysis: %s", e)
             return self._empty_result()

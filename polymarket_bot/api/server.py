@@ -955,6 +955,7 @@ class APIServer:
                 "trades_executed_today":       trades_today,
                 "arb_executed_today":          arb_today,
                 "current_mode":                mode,
+                "anthropic_available":         diag.get("anthropic_available", True),
                 "why_no_trades":               diag.get("why_no_trades", "No cycle run yet"),
                 "bot_running":                 bool(bot and getattr(bot, "_running", False)),
                 "cycle_count":                 getattr(bot, "_cycle_count", 0) if bot else 0,

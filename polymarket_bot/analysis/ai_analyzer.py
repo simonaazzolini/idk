@@ -32,6 +32,10 @@ _MAX_429_RETRIES = 2     # max retries before skipping the market
 _TOKEN_LIMIT     = 20000 # estimated token threshold for prompt truncation
 
 
+class _BillingError(Exception):
+    """Raised internally when Anthropic returns a billing/credit error."""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Prompts  (trimmed ~30% vs original — all analytical requirements kept)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,6 +184,11 @@ class AIAnalyzer:
         - Minimum gap:  settings.ai_min_call_interval_seconds (8 s default)
         - Window cap:   settings.ai_max_calls_per_minute calls per 60 s window
         - 429 handling: wait 60 s, retry ≤ 2 times, then skip market
+
+    Billing / credit handling:
+        - On first billing/credit error: set ai_available=False
+        - All subsequent calls return None immediately (no retries)
+        - Flag is reset to True at the start of each new cycle
     """
 
     def __init__(self, settings: Settings, cache: MarketDataCache):
@@ -191,6 +200,14 @@ class AIAnalyzer:
         self._call_errors:  int   = 0
         # Sliding-window call timestamps for per-minute rate limiting
         self._call_timestamps: collections.deque = collections.deque()
+        # Set to False when billing error is detected; reset each cycle
+        self.ai_available: bool = True
+
+    def reset_for_cycle(self) -> None:
+        """Call at the start of each bot cycle to re-enable AI after a billing error."""
+        if not self.ai_available:
+            logger.info("AI availability flag reset for new cycle — will attempt one call.")
+        self.ai_available = True
 
     def _get_client(self) -> anthropic.Anthropic:
         if self._client is None:
@@ -218,6 +235,11 @@ class AIAnalyzer:
         Returns AIAnalysisResult or None when analysis should be skipped.
         """
         slug = market.get("slug") or market.get("conditionId", "unknown")
+
+        # Skip immediately if billing error was already hit this cycle
+        if not self.ai_available:
+            logger.debug("AI unavailable (billing error this cycle) — skipping %s", slug[:30])
+            return None
 
         # Cache check
         cached = await self.cache.get_ai_analysis(slug)
@@ -291,6 +313,14 @@ class AIAnalyzer:
                     model=model,
                 ),
             )
+        except _BillingError:
+            self.ai_available = False
+            self._call_errors += 1
+            logger.error(
+                "AI disabled for remainder of this cycle (billing/credit error). "
+                "Will retry next cycle."
+            )
+            return None
         except Exception as e:
             self._call_errors += 1
             logger.warning("AI analysis failed for %s: %s", slug, e)
@@ -460,9 +490,14 @@ class AIAnalyzer:
 
             except anthropic.APIError as e:
                 err_str = str(e).lower()
-                billing_kws = ("credit", "billing", "balance", "payment", "quota", "overdue")
+                billing_kws = ("credit", "billing", "balance", "payment", "quota",
+                               "overdue", "insufficient", "exceeded")
                 if any(kw in err_str for kw in billing_kws):
-                    logger.warning("Anthropic billing error — skipping AI analysis: %s", e)
+                    logger.error(
+                        "Anthropic BILLING/CREDIT error — disabling AI for this cycle: %s", e
+                    )
+                    # Signal caller to set ai_available=False
+                    raise _BillingError(str(e)) from e
                 else:
                     logger.error("Anthropic API error: %s", e)
                 self._call_errors += 1

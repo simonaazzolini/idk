@@ -108,6 +108,7 @@ class PolymarketBot:
             "signals_logged": 0,
             "trades_executed": 0,
             "why_no_trades": "Starting up",
+            "anthropic_available": True,
         }
 
     async def startup(self) -> None:
@@ -201,6 +202,11 @@ class PolymarketBot:
         """
         logger.info("=== Main cycle %d starting ===", self._cycle_count + 1)
 
+        # Reset Anthropic availability flags at the start of every cycle
+        # so a billing error from the previous cycle gets one retry each cycle
+        self.ai_analyzer.reset_for_cycle()
+        self.news_analyzer.reset_for_cycle()
+
         # Step 1: Market discovery
         markets = await self._discover_markets()
         if not markets:
@@ -284,24 +290,37 @@ class PolymarketBot:
             logger.info("Arb scan: 0 opportunities found (orderbooks fetched: %d)",
                         len(self._current_orderbooks))
 
-        # Execute immediately-actionable arb opportunities
+        # Execute arb opportunities — completely independent of Anthropic availability.
+        # Gated only on portfolio safety (can_trade), NOT on AI/news status.
         _arb_executed = 0
+        _anthropic_ok = (
+            self.ai_analyzer.ai_available or self.news_analyzer.news_available
+        )
+        if not _anthropic_ok:
+            logger.info(
+                "Anthropic unavailable this cycle — arb execution proceeds independently"
+            )
         if can_trade:
-            for arb in self._arb_opportunities[:5]:  # top 5 (was 3)
-                # In paper mode: execute any arb > 0.3%; live: TYPE_1/TYPE_2 only
+            for arb in self._arb_opportunities[:5]:
+                # Paper mode: execute any arb >= 0.3%
+                # Live mode: execute TYPE_1/TYPE_2 only (mechanical arb, no AI needed)
+                # Extra condition: profit must be >= 0.5% to match user requirement
+                profit_ok = arb.profit_pct >= 0.005
                 if self.mode == "PAPER" and arb.profit_pct >= 0.003:
                     await self.executor.execute_arb(
                         arb, self.mode, self.portfolio.state.to_dict()
                     )
                     _arb_executed += 1
-                elif arb.arb_type in ("TYPE_1_YES_NO_SUM", "TYPE_2_CATEGORICAL"):
+                elif profit_ok and arb.arb_type in ("TYPE_1_YES_NO_SUM", "TYPE_2_CATEGORICAL"):
                     await self.executor.execute_arb(
                         arb, self.mode, self.portfolio.state.to_dict()
                     )
                     _arb_executed += 1
                 else:
-                    logger.debug("ARB not executed: type=%s profit=%.3f%% mode=%s",
-                                 arb.arb_type, arb.profit_pct * 100, self.mode)
+                    logger.debug(
+                        "ARB not executed: type=%s profit=%.3f%% (>=0.5%%=%s) mode=%s",
+                        arb.arb_type, arb.profit_pct * 100, profit_ok, self.mode,
+                    )
         self._diag["arb_executed"] = _arb_executed
 
         # Step 9-11: Aggregate signals, size, execute
@@ -340,6 +359,8 @@ class PolymarketBot:
                 orderbook_yes_metrics=ob_yes_map,
                 arb_scores=arb_scores_map,
                 open_positions=open_positions,
+                ai_available=self.ai_analyzer.ai_available,
+                news_available=self.news_analyzer.news_available,
             )
 
             # Update dashboard
@@ -388,9 +409,16 @@ class PolymarketBot:
             self._diag["signals_logged"] = _sigs_logged
             self._diag["trades_executed"] = _trades_executed
             self._diag["markets_analyzed"] = len(signals)
+            self._diag["anthropic_available"] = (
+                self.ai_analyzer.ai_available and self.news_analyzer.news_available
+            )
             ai_hits = sum(1 for s in signals if abs(s.ai_edge) > 0)
             self._diag["ai_signals_generated"] = ai_hits
-            if _trades_executed == 0 and _no_trade_reasons:
+            if not self.ai_analyzer.ai_available:
+                self._diag["why_no_trades"] = (
+                    "Anthropic credits empty — trading on tech+orderbook signals only"
+                )
+            elif _trades_executed == 0 and _no_trade_reasons:
                 self._diag["why_no_trades"] = "; ".join(_no_trade_reasons[:3])
             elif _trades_executed > 0:
                 self._diag["why_no_trades"] = f"Executed {_trades_executed} trade(s) this cycle"

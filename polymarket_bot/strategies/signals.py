@@ -96,6 +96,8 @@ class SignalAggregator:
         orderbook_yes=None,        # OrderbookMetrics or None
         arb_score: float = 0.0,
         open_positions: list = None,
+        ai_available: bool = True,
+        news_available: bool = True,
     ) -> TradeSignal:
         """
         Aggregate all signals for a market into a single trade decision.
@@ -122,6 +124,11 @@ class SignalAggregator:
 
         # ── Extract individual signals ────────────────────────────────────────
 
+        # Determine operating mode
+        _ai_degraded   = (ai_result is None)
+        _news_degraded = (news_result is None)
+        _no_anthropic  = (not ai_available and not news_available)
+
         # AI signal
         if ai_result:
             sig.ai_score = float(getattr(ai_result, "ai_score", 5.0) or 5.0)
@@ -132,6 +139,15 @@ class SignalAggregator:
             sig.ai_edge = float(getattr(ai_result, "edge", 0.0))
             sig.ai_confidence = float(getattr(ai_result, "confidence", 0.5))
             sig.signal_strength = str(getattr(ai_result, "signal_strength", "WEAK"))
+        elif _no_anthropic:
+            # Anthropic completely unavailable — use neutral placeholder,
+            # composite will be recalculated with tech+ob weights below
+            sig.ai_score = 5.0
+            sig.ai_direction = "NEUTRAL"
+            sig.ai_probability = current_price
+            sig.ai_edge = 0.0
+            sig.ai_confidence = 0.0
+            sig.signal_strength = "WEAK"
         else:
             sig.reason_skipped = "No AI analysis available"
             sig.action = "SKIP"
@@ -178,23 +194,44 @@ class SignalAggregator:
         sig.arb_score = clamp(arb_score, 0.0, 10.0)
 
         # ── Compute weighted composite score ──────────────────────────────────
-        composite = (
-            sig.ai_score * self.settings.ai_weight
-            + sig.whale_score * self.settings.whale_weight
-            + sig.news_score * self.settings.news_weight
-            + sig.technical_score * self.settings.technical_weight
-            + sig.orderbook_score * self.settings.orderbook_weight
-            + sig.arb_score * self.settings.arb_weight
-        )
+        if _no_anthropic:
+            # Anthropic credits empty — use technical + orderbook only (50/50)
+            # Arb is independent and always included
+            composite = (
+                sig.technical_score * 0.50
+                + sig.orderbook_score * 0.50
+            )
+            # Arb bonus on top (up to +2 pts)
+            composite += sig.arb_score * 0.20
+            logger.info(
+                "DEGRADED MODE (no Anthropic) %s | tech=%.1f ob=%.1f arb=%.1f composite=%.2f",
+                slug[:30], sig.technical_score, sig.orderbook_score,
+                sig.arb_score, composite,
+            )
+        else:
+            composite = (
+                sig.ai_score * self.settings.ai_weight
+                + sig.whale_score * self.settings.whale_weight
+                + sig.news_score * self.settings.news_weight
+                + sig.technical_score * self.settings.technical_weight
+                + sig.orderbook_score * self.settings.orderbook_weight
+                + sig.arb_score * self.settings.arb_weight
+            )
 
         # ── Direction reconciliation ──────────────────────────────────────────
-        directions = [
-            (sig.ai_direction, self.settings.ai_weight),
-            (sig.whale_direction, self.settings.whale_weight),
-            (sig.news_direction, self.settings.news_weight),
-            (sig.technical_direction, self.settings.technical_weight),
-            (sig.orderbook_direction, self.settings.orderbook_weight),
-        ]
+        if _no_anthropic:
+            directions = [
+                (sig.technical_direction, 0.50),
+                (sig.orderbook_direction, 0.50),
+            ]
+        else:
+            directions = [
+                (sig.ai_direction, self.settings.ai_weight),
+                (sig.whale_direction, self.settings.whale_weight),
+                (sig.news_direction, self.settings.news_weight),
+                (sig.technical_direction, self.settings.technical_weight),
+                (sig.orderbook_direction, self.settings.orderbook_weight),
+            ]
 
         yes_weight = sum(w for d, w in directions if d == "YES")
         no_weight = sum(w for d, w in directions if d == "NO")
@@ -226,53 +263,72 @@ class SignalAggregator:
         # ── Determine trade action ────────────────────────────────────────────
         ai_edge = sig.ai_edge
         abs_edge = abs(ai_edge)
-        outcome_direction = sig.final_direction
 
-        # Arb override: if pure arb detected with high score, skip directional check
-        if arb_score >= 9.0:
-            sig.action = "STRONG_BUY"
-            sig.final_direction = "YES"  # Arb specific legs handled elsewhere
-        elif sig.composite_score >= 5.5 and abs_edge >= 0.04:
-            sig.action = "STRONG_BUY"
-            if ai_edge < 0:
-                sig.final_direction = "NO"
-        elif sig.composite_score >= 4.0 and abs_edge >= 0.02:
-            sig.action = "BUY"
-            if ai_edge < 0:
-                sig.final_direction = "NO"
-        elif sig.composite_score >= 3.0 and abs_edge >= 0.01:
-            sig.action = "WEAK_BUY"
-            if ai_edge < 0:
-                sig.final_direction = "NO"
+        if _no_anthropic:
+            # Degraded mode: direction from technical/orderbook only,
+            # edge check skipped (no AI probability to compare against market price),
+            # lower composite threshold since we have less signal.
+            if arb_score >= 9.0:
+                sig.action = "STRONG_BUY"
+                sig.final_direction = "YES"
+            elif sig.composite_score >= 3.0 and sig.final_direction != "NEUTRAL":
+                sig.action = "BUY"
+            else:
+                sig.action = "SKIP"
+                sig.reason_skipped = (
+                    f"DEGRADED(no Anthropic): score={sig.composite_score:.1f} "
+                    f"dir={sig.final_direction}"
+                )
         else:
-            sig.action = "SKIP"
-            reasons = []
-            if abs_edge < 0.01:
-                reasons.append(f"edge too small ({ai_edge:+.3f})")
-            if sig.composite_score < 3.0:
-                reasons.append(f"score too low ({sig.composite_score:.1f})")
-            sig.reason_skipped = ", ".join(reasons) or "insufficient signal"
+            # Arb override: if pure arb detected with high score, skip directional check
+            if arb_score >= 9.0:
+                sig.action = "STRONG_BUY"
+                sig.final_direction = "YES"  # Arb specific legs handled elsewhere
+            elif sig.composite_score >= 5.5 and abs_edge >= 0.04:
+                sig.action = "STRONG_BUY"
+                if ai_edge < 0:
+                    sig.final_direction = "NO"
+            elif sig.composite_score >= 4.0 and abs_edge >= 0.02:
+                sig.action = "BUY"
+                if ai_edge < 0:
+                    sig.final_direction = "NO"
+            elif sig.composite_score >= 3.0 and abs_edge >= 0.01:
+                sig.action = "WEAK_BUY"
+                if ai_edge < 0:
+                    sig.final_direction = "NO"
+            else:
+                sig.action = "SKIP"
+                reasons = []
+                if abs_edge < 0.01:
+                    reasons.append(f"edge too small ({ai_edge:+.3f})")
+                if sig.composite_score < 3.0:
+                    reasons.append(f"score too low ({sig.composite_score:.1f})")
+                sig.reason_skipped = ", ".join(reasons) or "insufficient signal"
 
         # ── Confirmation requirements ─────────────────────────────────────────
         if sig.action != "SKIP":
-            # At least 2 of 6 signals must agree on direction
+            # In degraded mode only 2 signals exist; require both to agree (min 1)
+            min_agreeing = 1 if _no_anthropic else 2
             agreeing_signals = sum(
                 1 for d, _ in directions if d == sig.final_direction
             )
-            if agreeing_signals < 2:
+            if agreeing_signals < min_agreeing:
                 sig.action = "SKIP"
-                sig.reason_skipped = f"Only {agreeing_signals}/6 signals agree on {sig.final_direction}"
+                sig.reason_skipped = (
+                    f"Only {agreeing_signals} signal(s) agree on {sig.final_direction}"
+                )
 
-            # AI confidence must be >= 0.40 (was 0.55)
-            if sig.ai_confidence < 0.40:
+            # AI confidence gate — only applies when AI is actually available
+            if not _no_anthropic and sig.ai_confidence < 0.40:
                 sig.action = "SKIP"
                 sig.reason_skipped = f"AI confidence too low ({sig.ai_confidence:.2f})"
 
         # ── Data flow diagnostic log ──────────────────────────────────────────
+        mode_tag = "[DEGRADED]" if _no_anthropic else ""
         logger.info(
-            "SIGNAL %s | score=%.2f | ai_prob=%.3f | edge=%+.3f | conf=%.2f"
+            "SIGNAL %s%s | score=%.2f | ai_prob=%.3f | edge=%+.3f | conf=%.2f"
             " | whale=%s(%.1f) | action=%s%s",
-            slug[:30], sig.composite_score, sig.ai_probability, sig.ai_edge,
+            slug[:30], mode_tag, sig.composite_score, sig.ai_probability, sig.ai_edge,
             sig.ai_confidence, sig.whale_direction, sig.whale_score, sig.action,
             f" | skip={sig.reason_skipped}" if sig.action == "SKIP" else "",
         )
@@ -289,6 +345,8 @@ class SignalAggregator:
         orderbook_yes_metrics: dict,
         arb_scores: dict,
         open_positions: list,
+        ai_available: bool = True,
+        news_available: bool = True,
     ) -> list[TradeSignal]:
         """
         Aggregate signals for multiple markets, sorted by composite score.
@@ -305,6 +363,8 @@ class SignalAggregator:
                 orderbook_yes=orderbook_yes_metrics.get(slug),
                 arb_score=arb_scores.get(slug, 0.0),
                 open_positions=open_positions,
+                ai_available=ai_available,
+                news_available=news_available,
             )
             signals.append(signal)
 
