@@ -62,6 +62,10 @@ class WhaleTracker:
     async def full_refresh(self) -> None:
         """Full sweep: multiple wallet sources → trade history → compute metrics → classify."""
         logger.info("Starting full whale wallet database refresh...")
+
+        # Always purge stale mock wallets before inserting real ones.
+        deleted = await self.db.purge_mock_wallets()
+        logger.info("Mock wallet purge: removed %d rows before refresh", deleted)
         wallets: set[str] = set()
 
         # ── SOURCE 1: CLOB public trades (no auth required) ──────────────────
@@ -187,18 +191,26 @@ class WhaleTracker:
 
         logger.info("Collected %d unique wallet addresses across all sources", len(wallets))
 
-        # 2. For each wallet, fetch trade history and compute metrics
-        for i, wallet in enumerate(wallets):
-            try:
-                await self._refresh_single_wallet(wallet)
-                if i % 10 == 0:
-                    logger.info("Wallet refresh progress: %d/%d", i + 1, len(wallets))
-                await asyncio.sleep(0.3)
-            except Exception as e:
-                logger.debug("Wallet refresh failed for %s: %s", wallet[:8], e)
+        # 2. For each wallet, fetch trade history and compute metrics.
+        # Process in batches of 10 with asyncio.sleep(0.5) between batches so
+        # the event loop stays responsive and the main bot cycle is not starved.
+        wallet_list = list(wallets)
+        batch_size = 10
+        total = len(wallet_list)
+        for batch_start in range(0, total, batch_size):
+            batch = wallet_list[batch_start: batch_start + batch_size]
+            for wallet in batch:
+                try:
+                    await self._refresh_single_wallet(wallet)
+                except Exception as e:
+                    logger.debug("Wallet refresh failed for %s: %s", wallet[:8], e)
+            done = min(batch_start + batch_size, total)
+            logger.info("Wallet classification progress: %d/%d", done, total)
+            # Yield to event loop between batches so main cycle stays responsive
+            await asyncio.sleep(0.5)
 
         self._last_full_refresh = now_ts()
-        logger.info("Full whale refresh complete. Tracked %d wallets.", len(wallets))
+        logger.info("Full whale refresh complete. Tracked %d wallets.", total)
 
     async def _refresh_single_wallet(self, wallet: str) -> None:
         """Fetch trades + positions for one wallet, compute metrics, save to DB."""

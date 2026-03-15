@@ -153,9 +153,10 @@ class PolymarketBot:
             asyncio.create_task(self.whale_tracker.full_refresh(), name="whale_refresh")
             logger.info("Whale database refresh started in background")
 
-        # Smoke test: immediately paper trade $20 on highest-volume market to
-        # verify the full execution path works end-to-end before the first cycle.
-        await self._run_smoke_test()
+        # Schedule smoke test at 60 s so it never blocks startup or the first
+        # main cycle. The background whale refresh may still be running at t=0.
+        asyncio.create_task(self._delayed_smoke_test(60), name="smoke_test")
+        logger.info("Smoke test scheduled in 60 s (non-blocking)")
 
     async def _run_smoke_test(self) -> None:
         """
@@ -223,10 +224,22 @@ class PolymarketBot:
             print(f"SMOKE TEST TRADE: ERROR — {exc}")
             logger.warning("Smoke test trade failed (non-fatal): %s", exc, exc_info=True)
 
+    async def _delayed_smoke_test(self, delay_s: float) -> None:
+        """Run the smoke test after a fixed delay so startup is never blocked."""
+        await asyncio.sleep(delay_s)
+        await self._run_smoke_test()
+
     async def run(self) -> None:
         """Main bot loop."""
         self._running = True
         await self.startup()
+
+        # Give all background tasks (whale refresh, smoke test, WS) 30 s to
+        # settle before the first heavy main cycle.  The event loop is free
+        # during this sleep so the whale classifier and other background tasks
+        # can make progress.
+        logger.info("Startup complete — waiting 30 s before first main cycle")
+        await asyncio.sleep(30)
 
         # Launch fast loop as background task
         fast_loop_task = asyncio.create_task(self._fast_loop(), name="fast_loop")

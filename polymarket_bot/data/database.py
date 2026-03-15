@@ -413,6 +413,24 @@ class Database:
 
     # ── whale_wallets ─────────────────────────────────────────────────────────
 
+    async def purge_mock_wallets(self) -> int:
+        """
+        Delete all mock/fake wallets written by old code.
+        Matches rows where full_stats_json contains '"is_mock": true' or 'MOCK'.
+        Returns the number of rows deleted.
+        """
+        async with self._get_conn() as db:
+            async with db.execute(
+                "DELETE FROM whale_wallets "
+                "WHERE full_stats_json LIKE '%\"is_mock\": true%' "
+                "   OR full_stats_json LIKE '%MOCK%'"
+            ) as cur:
+                deleted = cur.rowcount
+            await db.commit()
+        if deleted:
+            logger.info("Purged %d mock wallets from whale_wallets table", deleted)
+        return deleted
+
     async def upsert_whale_wallet(self, wallet: dict) -> None:
         cols = list(wallet.keys())
         placeholders = ",".join("?" * len(cols))
