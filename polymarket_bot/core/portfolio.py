@@ -37,6 +37,7 @@ class PortfolioState:
     open_positions_count: int = 0
     daily_loss_limit_breached: bool = False
     max_drawdown_breached: bool = False
+    win_rate: float = 0.0
     mode: str = "PAPER"
 
     def to_dict(self) -> dict:
@@ -49,6 +50,7 @@ class PortfolioState:
             "total_unrealized_pnl": self.total_unrealized_pnl,
             "total_pnl": self.total_pnl,
             "roi_pct": self.roi_pct,
+            "win_rate": self.win_rate,
             "current_exposure": self.current_exposure,
             "peak_value": self.peak_value,
             "max_drawdown": self.max_drawdown,
@@ -81,6 +83,9 @@ class PortfolioManager:
         self.emergency_stop = EmergencyStop(settings)
         self._portfolio_value_history: list[float] = [budget]
         self._daily_pnl_series: list[float] = []
+        # Set to an APIServer instance to enable live WebSocket pushes after
+        # each trade.  Left as None when running without the API server.
+        self.api_server = None
 
     async def initialize(self) -> None:
         """Load state from database on startup."""
@@ -102,16 +107,12 @@ class PortfolioManager:
         """Update portfolio state after a new trade is opened."""
         self.state.cash_balance = max(0.0, self.state.cash_balance - size_usdc)
         self.state.current_exposure += size_usdc
-        self.state.total_position_value += size_usdc
-
-        # Reload open positions
-        self.state.open_positions = await self.db.get_open_trades(self.state.mode)
-        self.state.open_positions_count = len(self.state.open_positions)
-
-        await self._save_snapshot()
+        # Full recalculation from DB so every derived metric is consistent.
+        await self._recalculate_after_trade()
         logger.info(
-            "Trade opened: $%.2f | cash=$%.2f | exposure=$%.2f",
-            size_usdc, self.state.cash_balance, self.state.current_exposure
+            "Trade opened: $%.2f | cash=$%.2f | exposure=$%.2f | roi=%.2f%% | win_rate=%.1f%%",
+            size_usdc, self.state.cash_balance, self.state.current_exposure,
+            self.state.roi_pct, self.state.win_rate * 100,
         )
 
     async def on_trade_closed(
@@ -141,11 +142,9 @@ class PortfolioManager:
             if self.state.current_drawdown > self.state.max_drawdown:
                 self.state.max_drawdown = self.state.current_drawdown
 
-        # Reload open positions
-        self.state.open_positions = await self.db.get_open_trades(self.state.mode)
-        self.state.open_positions_count = len(self.state.open_positions)
-
-        await self._save_snapshot()
+        # Full recalculation reloads open positions, updates win_rate, saves
+        # the snapshot, and pushes the state to the dashboard.
+        await self._recalculate_after_trade()
 
     async def update_mark_to_market(
         self,
@@ -255,6 +254,96 @@ class PortfolioManager:
         await self._save_daily_performance()
 
         logger.info("New trading day started. Portfolio value: $%.2f", self.state.total_portfolio_value)
+
+    async def _recalculate_after_trade(
+        self, market_prices: Optional[dict] = None
+    ) -> None:
+        """
+        Recompute all portfolio metrics from the database after a trade is
+        inserted, then persist a snapshot and push the updated state to the
+        dashboard over WebSocket.
+
+        Steps:
+            1. Recalculate total_position_value from all open positions.
+            2. Update unrealized_pnl for each position using current_price
+               (falls back to entry price when no live quote is available).
+            3. Update roi_pct = total_pnl / total_budget * 100.
+            4. Update win_rate from all closed trades in the trades table.
+            5. Save snapshot + push to dashboard.
+
+        Args:
+            market_prices: optional {market_slug → current_price} mapping.
+                           Pass bot.portfolio_manager's latest price map for
+                           accurate mark-to-market; omit to use entry prices.
+        """
+        mode = self.state.mode
+        prices = market_prices or {}
+
+        # ── 1 & 2. Position value + unrealized PnL ───────────────────────────
+        open_trades = await self.db.get_open_trades(mode)
+        total_position_value = 0.0
+        total_unrealized = 0.0
+
+        for t in open_trades:
+            slug = t.get("market_slug", "")
+            outcome = str(t.get("outcome", "YES")).upper()
+            entry_price = float(t.get("fill_price") or t.get("price") or 0.5)
+            shares = float(t.get("shares") or 0)
+            size_usdc = float(t.get("size_usdc") or 0)
+
+            # Live price if available; at entry the value equals cost (unrealized=0)
+            current_price = (
+                prices.get(slug)
+                or prices.get(f"{slug}_{outcome}")
+                or entry_price
+            )
+            current_value = shares * current_price
+            total_position_value += current_value
+            total_unrealized += current_value - size_usdc
+
+        self.state.total_position_value = total_position_value
+        self.state.open_positions = open_trades
+        self.state.open_positions_count = len(open_trades)
+        self.state.total_unrealized_pnl = total_unrealized
+
+        # ── 3. ROI ────────────────────────────────────────────────────────────
+        self.state.total_pnl = self.state.total_realized_pnl + total_unrealized
+        self.state.total_portfolio_value = (
+            self.state.cash_balance + total_position_value
+        )
+        self.state.roi_pct = (
+            safe_div(self.state.total_pnl, self.state.total_budget) * 100
+        )
+
+        # ── 4. Win rate from all closed trades ────────────────────────────────
+        closed = await self.db.get_all_closed_trades(mode)
+        pnls = [float(t.get("pnl") or 0) for t in closed if t.get("pnl") is not None]
+        self.state.win_rate = (
+            safe_div(sum(1 for p in pnls if p > 0), len(pnls)) if pnls else 0.0
+        )
+
+        # ── 5. Persist + push ─────────────────────────────────────────────────
+        await self._save_snapshot()
+        await self._push_to_dashboard()
+        logger.debug(
+            "Portfolio recalculated | pos_value=$%.2f unrealized=$%.2f "
+            "roi=%.2f%% win_rate=%.1f%% positions=%d",
+            total_position_value, total_unrealized,
+            self.state.roi_pct, self.state.win_rate * 100,
+            len(open_trades),
+        )
+
+    async def _push_to_dashboard(self) -> None:
+        """
+        Broadcast the current portfolio state over WebSocket via the API server.
+        No-ops silently when api_server has not been wired in.
+        """
+        if self.api_server is None:
+            return
+        try:
+            await self.api_server.broadcast_portfolio_update(self.state.to_dict())
+        except Exception as exc:
+            logger.debug("Portfolio dashboard push failed: %s", exc)
 
     async def _save_snapshot(self) -> None:
         """Save current portfolio state to the database."""

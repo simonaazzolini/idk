@@ -122,6 +122,9 @@ class APIServer:
         self._start_ts: float = time.time()
         self._server_task: Optional[asyncio.Task] = None
         self._server: Optional[uvicorn.Server] = None
+        # Latest portfolio state pushed by PortfolioManager; served as a fast
+        # in-memory overlay on top of the DB for the /api/portfolio endpoint.
+        self._live_portfolio: dict = {}
 
         self.app = FastAPI(title="Polymarket Bot Dashboard API", version="1.0")
         self.app.add_middleware(
@@ -191,6 +194,20 @@ class APIServer:
 
     async def broadcast_paper_evaluation(self, go: bool, stats: dict) -> None:
         await self.mgr.broadcast("paper_evaluation", {"go": go, "stats": stats})
+
+    async def broadcast_portfolio_update(self, state: dict) -> None:
+        """
+        Called by PortfolioManager after every trade to push live metrics to
+        all connected dashboard clients.  Also caches the state so the REST
+        /api/portfolio endpoint can serve it instantly without a DB round-trip.
+
+        Payload fields that the dashboard header consumes:
+            total_pnl, realized_pnl, unrealized_pnl, roi_pct,
+            win_rate, cash_balance, total_portfolio_value,
+            open_positions_count
+        """
+        self._live_portfolio = state
+        await self.mgr.broadcast("portfolio_update", state)
 
     # ── Route registration ────────────────────────────────────────────────────
 
@@ -411,17 +428,32 @@ class APIServer:
             unrealized = _safe_float(s.get("unrealized_pnl", 0))
             cash = _safe_float(s.get("cash_balance", total_budget - sum(_safe_float(r["size_usdc"]) for r in open_pos)))
 
+            # Prefer live in-memory values pushed by PortfolioManager after each
+            # trade; fall back to DB snapshot values when no live push has arrived.
+            lp = server_self._live_portfolio
+            live_realized   = _safe_float(lp.get("total_realized_pnl",  realized))
+            live_unrealized = _safe_float(lp.get("total_unrealized_pnl", unrealized))
+            live_cash       = _safe_float(lp.get("cash_balance",         cash))
+            live_pos_value  = _safe_float(lp.get("total_position_value",
+                                                  _safe_float(s.get("position_value", 0))))
+            live_total      = _safe_float(lp.get("total_portfolio_value",
+                                                  _safe_float(s.get("total_value", total_budget))))
+            live_roi        = _safe_float(lp.get("roi_pct",
+                                                  _safe_float(s.get("roi_pct",
+                                                  (realized + unrealized) / total_budget * 100))))
+            live_win_rate   = _safe_float(lp.get("win_rate", win_rate))
+
             return {
                 "total_budget": total_budget,
-                "cash_balance": round(cash, 2),
-                "position_value": round(_safe_float(s.get("position_value", 0)), 2),
-                "total_portfolio_value": round(_safe_float(s.get("total_value", total_budget)), 2),
-                "realized_pnl": round(realized, 2),
-                "unrealized_pnl": round(unrealized, 2),
-                "total_pnl": round(realized + unrealized, 2),
-                "roi_pct": round(_safe_float(s.get("roi_pct", (realized + unrealized) / total_budget * 100)), 2),
+                "cash_balance": round(live_cash, 2),
+                "position_value": round(live_pos_value, 2),
+                "total_portfolio_value": round(live_total, 2),
+                "realized_pnl": round(live_realized, 2),
+                "unrealized_pnl": round(live_unrealized, 2),
+                "total_pnl": round(live_realized + live_unrealized, 2),
+                "roi_pct": round(live_roi, 2),
                 "max_drawdown": round(max_dd, 4),
-                "win_rate": round(win_rate, 4),
+                "win_rate": round(live_win_rate, 4),
                 "profit_factor": round(min(pf, 99.0), 2),
                 "sharpe_ratio": round(sharpe, 2),
                 "total_trades": n,

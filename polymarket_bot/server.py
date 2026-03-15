@@ -25,7 +25,7 @@ ROOT     = Path(__file__).parent.parent          # repo root  (idk/)
 BOT_DIR  = Path(__file__).parent                 # polymarket_bot/
 sys.path.insert(0, str(BOT_DIR))
 
-from api.server import APIServer, _scalar, _execute
+from api.server import APIServer, _scalar, _execute, _query
 from config.settings import settings as _settings
 from utils.logger import setup_logging
 
@@ -130,27 +130,34 @@ async def _poll_paper_eval(server: APIServer) -> None:
 
 async def _poll_new_events(server: APIServer) -> None:
     """
-    Detect new rows in trades/paper_trades and whale_trades since last
-    broadcast, and push them over WebSocket so the dashboard event feed
-    updates in real time without waiting for the 15 s polling interval.
-    """
-    last_trade_id:  int = 0
-    last_whale_id:  int = 0
+    Detect new rows in trades/paper_trades, whale_trades, and
+    portfolio_snapshots since last broadcast, and push them over WebSocket
+    so the dashboard updates in real time without waiting for the 15 s
+    polling interval.
 
-    # Seed with current max IDs so we don't re-broadcast old rows on startup
+    portfolio_update events carry live P&L, ROI, and win_rate so the
+    dashboard header reflects the latest values after every trade.
+    """
+    last_trade_id:      int   = 0
+    last_whale_id:      int   = 0
+    last_portfolio_ts:  float = 0.0
+
+    # Seed with current max IDs/timestamps so we don't re-broadcast old rows
     try:
         last_trade_id = int(await _scalar(
             DB_PATH, "SELECT COALESCE(MAX(id),0) FROM ("
                      "SELECT id FROM trades UNION ALL SELECT id FROM paper_trades)") or 0)
         last_whale_id = int(await _scalar(
             DB_PATH, "SELECT COALESCE(MAX(id),0) FROM whale_trades") or 0)
+        last_portfolio_ts = float(await _scalar(
+            DB_PATH, "SELECT COALESCE(MAX(timestamp),0) FROM portfolio_snapshots") or 0)
     except Exception:
         pass
 
     while True:
         await asyncio.sleep(8)
         try:
-            # New trades
+            # ── New trades ────────────────────────────────────────────────────
             rows = await _scalar(
                 DB_PATH,
                 "SELECT COUNT(*) FROM ("
@@ -168,7 +175,7 @@ async def _poll_new_events(server: APIServer) -> None:
                     await server.mgr.broadcast("cycle", {"new_trades": int(rows)})
                     last_trade_id = new_max
 
-            # New whale trades
+            # ── New whale trades ──────────────────────────────────────────────
             new_whale_id = int(await _scalar(
                 DB_PATH,
                 "SELECT COALESCE(MAX(id),0) FROM whale_trades WHERE id > ?",
@@ -190,6 +197,57 @@ async def _poll_new_events(server: APIServer) -> None:
                         "alert_level": "HIGH",
                     })
                 last_whale_id = new_whale_id
+
+            # ── New portfolio snapshot → broadcast portfolio_update ───────────
+            # PortfolioManager writes a snapshot after every _recalculate_after_trade
+            # call.  We detect the new row, augment it with a fresh win_rate
+            # from the trades table, and push a portfolio_update WS event so the
+            # dashboard header (P&L, ROI, win rate) reflects the latest trade.
+            new_portfolio_ts = float(await _scalar(
+                DB_PATH,
+                "SELECT COALESCE(MAX(timestamp),0) FROM portfolio_snapshots") or 0)
+            if new_portfolio_ts > last_portfolio_ts:
+                last_portfolio_ts = new_portfolio_ts
+                snap_rows = await _query(
+                    DB_PATH,
+                    "SELECT * FROM portfolio_snapshots ORDER BY timestamp DESC LIMIT 1")
+                if snap_rows:
+                    snap = snap_rows[0]
+                    mode = str(await _scalar(
+                        DB_PATH, "SELECT value FROM bot_state WHERE key='mode'") or "PAPER")
+                    table = "paper_trades" if mode == "PAPER" else "trades"
+                    total_budget = float(
+                        await _scalar(DB_PATH,
+                                      "SELECT value FROM bot_state WHERE key='budget'") or 1000)
+                    # Win rate: closed trades with a PnL result
+                    closed_rows = await _query(
+                        DB_PATH,
+                        f"SELECT pnl FROM {table} WHERE status='CLOSED' AND pnl IS NOT NULL")
+                    pnls = [float(r["pnl"]) for r in closed_rows]
+                    win_rate = (
+                        sum(1 for p in pnls if p > 0) / len(pnls) if pnls else 0.0
+                    )
+                    realized   = float(snap.get("realized_pnl") or 0)
+                    unrealized = float(snap.get("unrealized_pnl") or 0)
+                    payload = {
+                        "total_budget":          total_budget,
+                        "cash_balance":          round(float(snap.get("cash_balance") or 0), 2),
+                        "total_position_value":  round(float(snap.get("position_value") or 0), 2),
+                        "total_portfolio_value": round(float(snap.get("total_value") or total_budget), 2),
+                        "total_realized_pnl":    round(realized, 2),
+                        "total_unrealized_pnl":  round(unrealized, 2),
+                        "total_pnl":             round(realized + unrealized, 2),
+                        "roi_pct":               round(float(snap.get("roi_pct") or 0), 2),
+                        "win_rate":              round(win_rate, 4),
+                        "open_positions_count":  int(snap.get("open_positions_count") or 0),
+                        "max_drawdown":          round(float(snap.get("drawdown") or 0), 4),
+                    }
+                    # Cache in server so /api/portfolio REST serves fresh values
+                    server._live_portfolio = payload
+                    await server.mgr.broadcast("portfolio_update", payload)
+                    logger.debug(
+                        "portfolio_update broadcast: pnl=%.2f roi=%.2f%% win_rate=%.1f%%",
+                        payload["total_pnl"], payload["roi_pct"], win_rate * 100)
 
         except Exception as exc:
             logger.debug("_poll_new_events: %s", exc)
