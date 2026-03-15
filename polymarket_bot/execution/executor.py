@@ -356,6 +356,10 @@ class OrderExecutor:
         if mode == "PAPER":
             # Simulate arb fill
             fill_price = arb.legs[0].get("price", 0.5) if arb.legs else 0.5
+            # Weighted avg entry price across all legs
+            total_size = sum(leg.get("size", 0) for leg in arb.legs) or 1.0
+            avg_price = sum(leg.get("price", 0.5) * leg.get("size", 0) for leg in arb.legs) / total_size
+
             await self.db.insert_arb_trade({
                 "timestamp": now_ts(),
                 "arb_type": arb.arb_type,
@@ -366,12 +370,50 @@ class OrderExecutor:
                 "executed": 1,
                 "execution_time_ms": 0,
             })
+
+            # Also write to main trades table so arb trades appear on the
+            # Trades tab and contribute to portfolio P&L tracking.
+            # status="FILLED" because arb profit is locked in at entry (instant).
+            import uuid as _uuid
+            trade_id = await self.db.insert_trade({
+                "timestamp": now_ts(),
+                "mode": "PAPER",
+                "market_slug": arb.market_slug,
+                "question": arb.description,
+                "category": "ARB",
+                "outcome": "ARB",
+                "side": "BUY",
+                "price": avg_price,
+                "size_usdc": arb.max_size,
+                "shares": arb.max_size / max(avg_price, 0.001),
+                "order_id": f"ARB_{_uuid.uuid4().hex[:8]}",
+                "order_type": "ARB",
+                "fill_price": avg_price,
+                "slippage": 0.001,
+                "status": "FILLED",
+                "pnl": arb.profit_usdc,
+                "hold_hours": 0.0,
+                "exit_reason": "Arb locked-in profit",
+                "composite_score": 10.0,
+                "ai_probability": 1.0,
+                "ai_edge": arb.profit_pct,
+                "ai_confidence": 1.0,
+                "whale_score": 0.0,
+                "news_score": 0.0,
+                "technical_score": 0.0,
+                "arb_score": 10.0,
+                "signal_strength": "VERY_STRONG",
+                "is_whale_copy": 0,
+                "source_wallet": "ARB",
+            })
+
             logger.info(
-                "[PAPER] ARB: %s %s profit=$%.2f (%.2f%%)",
-                arb.arb_type, arb.market_slug[:25], arb.profit_usdc, arb.profit_pct * 100
+                "[PAPER] ARB: %s %s profit=$%.2f (%.2f%%) trade_id=%d",
+                arb.arb_type, arb.market_slug[:25], arb.profit_usdc, arb.profit_pct * 100, trade_id,
             )
             return ExecutionResult(
-                True, f"ARB_{arb.arb_type}", fill_price, arb.max_size, 0.001, mode,
+                True, f"ARB_{arb.arb_type}", avg_price, arb.max_size, 0.001, mode,
+                trade_id=trade_id,
                 reason=f"Arb executed: {arb.description}",
                 is_paper=True,
             )
@@ -394,6 +436,9 @@ class OrderExecutor:
         execution_ms = (now_ts() - start_ts) * 1000
 
         success_count = sum(1 for r in results if isinstance(r, dict) and r)
+        executed_ok = success_count == len(tasks)
+        fill_price_live = arb.legs[0].get("price", 0) if arb.legs else 0
+
         await self.db.insert_arb_trade({
             "timestamp": now_ts(),
             "arb_type": arb.arb_type,
@@ -401,17 +446,54 @@ class OrderExecutor:
             "legs_json": json.dumps(arb.legs),
             "profit_usdc": arb.profit_usdc,
             "profit_pct": arb.profit_pct,
-            "executed": int(success_count == len(tasks)),
+            "executed": int(executed_ok),
             "execution_time_ms": execution_ms,
         })
 
+        # Also write to main trades table for dashboard visibility
+        import uuid as _uuid
+        live_total_size = sum(leg.get("size", 0) for leg in arb.legs) or 1.0
+        live_avg_price = sum(leg.get("price", 0.5) * leg.get("size", 0) for leg in arb.legs) / live_total_size
+        live_trade_id = await self.db.insert_trade({
+            "timestamp": now_ts(),
+            "mode": "LIVE",
+            "market_slug": arb.market_slug,
+            "question": arb.description,
+            "category": "ARB",
+            "outcome": "ARB",
+            "side": "BUY",
+            "price": live_avg_price,
+            "size_usdc": arb.max_size,
+            "shares": arb.max_size / max(live_avg_price, 0.001),
+            "order_id": f"ARB_{_uuid.uuid4().hex[:8]}",
+            "order_type": "ARB",
+            "fill_price": live_avg_price,
+            "slippage": 0.001,
+            "status": "FILLED" if executed_ok else "FAILED",
+            "pnl": arb.profit_usdc if executed_ok else 0.0,
+            "hold_hours": 0.0,
+            "exit_reason": f"Arb {success_count}/{len(tasks)} legs filled",
+            "composite_score": 10.0,
+            "ai_probability": 1.0,
+            "ai_edge": arb.profit_pct,
+            "ai_confidence": 1.0,
+            "whale_score": 0.0,
+            "news_score": 0.0,
+            "technical_score": 0.0,
+            "arb_score": 10.0,
+            "signal_strength": "VERY_STRONG",
+            "is_whale_copy": 0,
+            "source_wallet": "ARB",
+        })
+
         return ExecutionResult(
-            success=success_count == len(tasks),
+            success=executed_ok,
             order_id=f"ARB_{arb.arb_type}",
-            fill_price=arb.legs[0].get("price", 0) if arb.legs else 0,
+            fill_price=fill_price_live,
             fill_size=arb.max_size,
             slippage=0.001,
             mode=mode,
+            trade_id=live_trade_id,
             reason=f"Arb {success_count}/{len(tasks)} legs filled",
             is_paper=False,
         )

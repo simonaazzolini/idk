@@ -407,9 +407,20 @@ class PolymarketBot:
                         arb.arb_type, arb.market_slug[:25],
                         arb.profit_pct, arb.profit_pct * 100,
                     )
-                    await self.executor.execute_arb(
+                    _arb_result = await self.executor.execute_arb(
                         arb, self.mode, self.portfolio.state.to_dict()
                     )
+                    if _arb_result.success:
+                        # Credit locked-in profit to portfolio P&L immediately.
+                        # size_usdc=0 because no capital remains deployed after instant arb.
+                        await self.portfolio.on_trade_closed(
+                            _arb_result.trade_id, arb.profit_usdc, 0.0
+                        )
+                        logger.info(
+                            "ARB P&L credited: +$%.2f | realized_pnl=+$%.2f",
+                            arb.profit_usdc,
+                            self.portfolio.state.total_realized_pnl,
+                        )
                     _arb_executed += 1
                 # Live mode: execute TYPE_1/TYPE_2 only (mechanical arb, no AI needed)
                 elif arb.profit_pct >= 0.005 and arb.arb_type in ("TYPE_1_YES_NO_SUM", "TYPE_2_CATEGORICAL"):
@@ -418,9 +429,18 @@ class PolymarketBot:
                         arb.arb_type, arb.market_slug[:25],
                         arb.profit_pct, arb.profit_pct * 100,
                     )
-                    await self.executor.execute_arb(
+                    _arb_result = await self.executor.execute_arb(
                         arb, self.mode, self.portfolio.state.to_dict()
                     )
+                    if _arb_result.success:
+                        await self.portfolio.on_trade_closed(
+                            _arb_result.trade_id, arb.profit_usdc, 0.0
+                        )
+                        logger.info(
+                            "ARB P&L credited: +$%.2f | realized_pnl=+$%.2f",
+                            arb.profit_usdc,
+                            self.portfolio.state.total_realized_pnl,
+                        )
                     _arb_executed += 1
                 else:
                     logger.info(
