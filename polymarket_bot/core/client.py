@@ -100,6 +100,34 @@ class DataClient:
             resp.raise_for_status()
             return await resp.json(content_type=None)
 
+    async def fetch_raw(self, url: str, params: Optional[dict] = None) -> tuple[int, Any]:
+        """
+        GET any URL, log the full status code + body, return (status, parsed_data).
+        Never raises — callers use the status code to decide what to do.
+        """
+        await self._rate_limiter.acquire()
+        try:
+            async with self._session.get(url, params=params) as resp:
+                status = resp.status
+                try:
+                    body = await resp.text()
+                except Exception:
+                    body = "<unreadable body>"
+                logger.info(
+                    "HTTP GET %s params=%s → status=%d | body=%s",
+                    url, params, status, body[:800],
+                )
+                if status >= 400:
+                    return status, None
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    data = None
+                return status, data
+        except Exception as e:
+            logger.warning("HTTP GET %s failed: %s", url, e)
+            return 0, None
+
     async def get_leaderboard(self, window: str = "all", limit: int = 100) -> list[dict]:
         data = await self._get("/leaderboard", {"window": window, "limit": limit, "sort": "profit"})
         logger.debug("Leaderboard raw response (window=%s): %s", window, str(data)[:500])

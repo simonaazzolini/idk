@@ -60,122 +60,133 @@ class WhaleTracker:
     # ── Step A: Build wallet database ─────────────────────────────────────────
 
     async def full_refresh(self) -> None:
-        """Full sweep: leaderboard → trade history → compute metrics → classify."""
+        """Full sweep: multiple wallet sources → trade history → compute metrics → classify."""
         logger.info("Starting full whale wallet database refresh...")
-
-        # 1. Collect wallets from leaderboard — try multiple endpoints
         wallets: set[str] = set()
 
-        # 1a. Standard leaderboard windows
-        for window in ["all", "1m", "7d", "1d"]:
-            try:
-                board = await self.client.data.get_leaderboard(window=window, limit=100)
-                logger.info(
-                    "Leaderboard window=%s: %d entries | full response: %s",
-                    window, len(board) if board else 0, str(board)[:800],
-                )
-                for entry in (board or []):
-                    addr = (
-                        entry.get("proxyWallet")
-                        or entry.get("proxy_address")
-                        or entry.get("address")
-                        or entry.get("user")
-                        or entry.get("wallet")
-                        or entry.get("account")
-                    )
+        # ── SOURCE 1: CLOB public trades (no auth required) ──────────────────
+        # https://clob.polymarket.com/trades — returns taker "owner" + maker_orders
+        clob_trades_url = "https://clob.polymarket.com/trades"
+        status, data = await self.client.data.fetch_raw(
+            clob_trades_url, {"limit": 1000}
+        )
+        logger.info("CLOB /trades → status=%d, records=%s", status,
+                    len(data) if isinstance(data, list) else "non-list")
+        if isinstance(data, list):
+            for t in data:
+                owner = t.get("owner") or t.get("taker_address") or ""
+                if owner:
+                    wallets.add(str(owner).lower())
+                for m in t.get("maker_orders", []):
+                    ma = m.get("maker_address") or m.get("owner") or ""
+                    if ma:
+                        wallets.add(str(ma).lower())
+            logger.info("CLOB /trades → %d wallets extracted", len(wallets))
+        await asyncio.sleep(0.3)
+
+        # ── SOURCE 2: Data API activity with minSize filter ───────────────────
+        act_url = "https://data-api.polymarket.com/activity"
+        status, data = await self.client.data.fetch_raw(
+            act_url, {"limit": 500, "type": "trade", "minSize": 500}
+        )
+        logger.info("data-api /activity?minSize=500 → status=%d, records=%s",
+                    status, len(data) if isinstance(data, list) else
+                    (len(data.get("data", [])) if isinstance(data, dict) else "none"))
+        if data:
+            rows = data if isinstance(data, list) else data.get("data", [])
+            before = len(wallets)
+            for row in (rows or []):
+                for field in ("proxyWallet", "maker_address", "taker_address",
+                              "maker", "owner", "user"):
+                    addr = row.get(field) or ""
                     if addr:
                         wallets.add(str(addr).lower())
-                if wallets:
-                    logger.info(
-                        "Leaderboard window=%s → %d wallets collected",
-                        window, len(wallets),
-                    )
-                    break
-                logger.warning("Leaderboard window=%s returned 0 usable addresses", window)
-            except Exception as e:
-                logger.warning("Leaderboard fetch failed for window=%s: %s", window, e)
-            await asyncio.sleep(0.5)
+            logger.info("data-api /activity → added %d wallets (total=%d)",
+                        len(wallets) - before, len(wallets))
+        await asyncio.sleep(0.3)
 
-        # 1b. Try /profiles endpoint if leaderboard yielded nothing
-        if not wallets:
-            try:
-                raw = await self.client.data._get("/profiles", {"limit": 100, "sort": "volume"})
-                logger.info("Profiles endpoint response: %s", str(raw)[:800])
-                profiles = raw if isinstance(raw, list) else (raw or {}).get("data", [])
-                for p in (profiles or []):
-                    addr = (p.get("proxyWallet") or p.get("address") or p.get("user") or "")
-                    if addr:
-                        wallets.add(str(addr).lower())
-                logger.info("/profiles fallback → %d wallets", len(wallets))
-            except Exception as e:
-                logger.warning("/profiles fallback failed: %s", e)
+        # ── SOURCE 3: Gamma API profiles ──────────────────────────────────────
+        gamma_prof_url = "https://gamma-api.polymarket.com/profiles"
+        status, data = await self.client.data.fetch_raw(
+            gamma_prof_url, {"limit": 100}
+        )
+        logger.info("gamma /profiles → status=%d, records=%s", status,
+                    len(data) if isinstance(data, list) else
+                    (len(data.get("data", [])) if isinstance(data, dict) else "none"))
+        if data:
+            rows = data if isinstance(data, list) else data.get("data", [])
+            before = len(wallets)
+            for row in (rows or []):
+                addr = (row.get("proxyWallet") or row.get("address")
+                        or row.get("user") or "")
+                if addr:
+                    wallets.add(str(addr).lower())
+            logger.info("gamma /profiles → added %d wallets (total=%d)",
+                        len(wallets) - before, len(wallets))
+        await asyncio.sleep(0.3)
 
-        # 1c. Try /activity endpoint for recent active traders
-        if not wallets:
-            try:
-                raw = await self.client.data._get("/activity", {"limit": 500, "type": "trade"})
-                logger.info("Activity endpoint response (first 800 chars): %s", str(raw)[:800])
-                activities = raw if isinstance(raw, list) else (raw or {}).get("data", [])
-                for a in (activities or []):
-                    addr = (a.get("proxyWallet") or a.get("maker") or a.get("user") or "")
-                    if addr:
-                        wallets.add(str(addr).lower())
-                logger.info("/activity fallback → %d wallets", len(wallets))
-            except Exception as e:
-                logger.warning("/activity fallback failed: %s", e)
-
-        # 2. Fall back to recent large trades — lower threshold to minSize=100
-        if not wallets:
-            logger.warning(
-                "All leaderboard endpoints returned 0 wallets — "
-                "seeding from recent trades (minSize=100)"
+        # ── SOURCE 4: Data API leaderboard windows ────────────────────────────
+        for window in ["all", "1m", "7d"]:
+            lb_url = "https://data-api.polymarket.com/leaderboard"
+            status, data = await self.client.data.fetch_raw(
+                lb_url, {"window": window, "limit": 100, "sort": "profit"}
             )
-            try:
-                trades = await self.client.data.get_trades(limit=1000, min_size=100)
-                logger.info("Trades fallback: fetched %d trades", len(trades))
-                for trade in trades:
-                    for field in ("maker_address", "taker_address", "maker", "taker"):
-                        addr = trade.get(field)
+            logger.info("data-api /leaderboard?window=%s → status=%d, records=%s",
+                        window, status,
+                        len(data) if isinstance(data, list) else
+                        (len(data.get("data", data.get("leaderboard", [])))
+                         if isinstance(data, dict) else "none"))
+            if data:
+                rows = (data if isinstance(data, list)
+                        else data.get("data", data.get("leaderboard",
+                        data.get("results", []))))
+                before = len(wallets)
+                for row in (rows or []):
+                    addr = (row.get("proxyWallet") or row.get("proxy_address")
+                            or row.get("address") or row.get("user")
+                            or row.get("wallet") or "")
+                    if addr:
+                        wallets.add(str(addr).lower())
+                logger.info("leaderboard window=%s → added %d wallets (total=%d)",
+                            window, len(wallets) - before, len(wallets))
+            await asyncio.sleep(0.4)
+
+        # ── SOURCE 5: Data API trades (broadest fallback, minSize=100) ────────
+        if len(wallets) < 10:
+            logger.warning(
+                "Only %d wallets from primary sources — fetching /trades?minSize=100",
+                len(wallets),
+            )
+            dt_url = "https://data-api.polymarket.com/trades"
+            status, data = await self.client.data.fetch_raw(
+                dt_url, {"limit": 1000, "minSize": 100}
+            )
+            logger.info("data-api /trades?minSize=100 → status=%d, records=%s",
+                        status, len(data) if isinstance(data, list) else
+                        (len(data.get("data", [])) if isinstance(data, dict) else "none"))
+            if data:
+                rows = data if isinstance(data, list) else data.get("data", [])
+                before = len(wallets)
+                for t in (rows or []):
+                    for field in ("maker_address", "taker_address", "maker",
+                                  "taker", "owner"):
+                        addr = t.get(field) or ""
                         if addr:
                             wallets.add(str(addr).lower())
-                logger.info(
-                    "Trades fallback → %d wallets found",
-                    len(wallets),
-                )
-            except Exception as e:
-                logger.warning("Trade-based wallet fallback also failed: %s", e)
+                logger.info("data-api /trades → added %d wallets (total=%d)",
+                            len(wallets) - before, len(wallets))
 
-        # 3. If EVERYTHING failed, seed with mock wallets so UI is never empty
+        # ── No wallets at all — log clearly and bail without fake data ────────
         if not wallets:
             logger.error(
-                "ALL wallet discovery methods failed. Seeding 5 MOCK wallets "
-                "so the whale tab displays correctly."
+                "ALL wallet discovery sources returned 0 addresses. "
+                "Whale tab will show 'Building wallet database — no data yet'. "
+                "Check network connectivity and API endpoint availability."
             )
-            mock_addrs = [
-                "0xmock_whale_1000000000000000000000000000001",
-                "0xmock_whale_1000000000000000000000000000002",
-                "0xmock_whale_1000000000000000000000000000003",
-                "0xmock_whale_1000000000000000000000000000004",
-                "0xmock_whale_1000000000000000000000000000005",
-            ]
-            for addr in mock_addrs:
-                await self.db.upsert_whale_wallet({
-                    "address": addr,
-                    "tier_tags": '["SMART_MONEY"]',
-                    "win_rate": 0.55,
-                    "total_pnl": 0.0,
-                    "total_volume": 0.0,
-                    "total_trades": 0,
-                    "avg_position_size": 0.0,
-                    "insider_score": 0.0,
-                    "is_bot": 0,
-                    "full_stats_json": '{"mock":true,"note":"API_UNAVAILABLE"}',
-                })
-            logger.warning("Mock wallets seeded (flagged as mock in full_stats_json)")
             self._last_full_refresh = now_ts()
             return
 
-        logger.info("Collected %d unique wallets from leaderboards", len(wallets))
+        logger.info("Collected %d unique wallet addresses across all sources", len(wallets))
 
         # 2. For each wallet, fetch trade history and compute metrics
         for i, wallet in enumerate(wallets):
