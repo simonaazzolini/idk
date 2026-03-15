@@ -65,64 +65,68 @@ class WhaleTracker:
         wallets: set[str] = set()
 
         # ── SOURCE 1: CLOB public trades (no auth required) ──────────────────
-        # https://clob.polymarket.com/trades — returns taker "owner" + maker_orders
         clob_trades_url = "https://clob.polymarket.com/trades"
         status, data = await self.client.data.fetch_raw(
             clob_trades_url, {"limit": 1000}
         )
-        logger.info("CLOB /trades → status=%d, records=%s", status,
-                    len(data) if isinstance(data, list) else "non-list")
-        if isinstance(data, list):
-            for t in data:
-                owner = t.get("owner") or t.get("taker_address") or ""
-                if owner:
-                    wallets.add(str(owner).lower())
-                for m in t.get("maker_orders", []):
-                    ma = m.get("maker_address") or m.get("owner") or ""
-                    if ma:
-                        wallets.add(str(ma).lower())
-            logger.info("CLOB /trades → %d wallets extracted", len(wallets))
+        rows = _as_rows(data)
+        logger.info("CLOB /trades → status=%d, records=%d", status, len(rows))
+        if rows:
+            logger.info("CLOB sample trade keys: %s", list(rows[0].keys()))
+            logger.info("CLOB sample trade object: %s", rows[0])
+        before = len(wallets)
+        for row in rows:
+            wallets |= _extract_eth_addresses(row)
+        logger.info("CLOB /trades → extracted %d addresses (total=%d)",
+                    len(wallets) - before, len(wallets))
         await asyncio.sleep(0.3)
 
-        # ── SOURCE 2: Data API activity with minSize filter ───────────────────
-        act_url = "https://data-api.polymarket.com/activity"
-        status, data = await self.client.data.fetch_raw(
-            act_url, {"limit": 500, "type": "trade", "minSize": 500}
-        )
-        logger.info("data-api /activity?minSize=500 → status=%d, records=%s",
-                    status, len(data) if isinstance(data, list) else
-                    (len(data.get("data", [])) if isinstance(data, dict) else "none"))
-        if data:
-            rows = data if isinstance(data, list) else data.get("data", [])
-            before = len(wallets)
-            for row in (rows or []):
-                for field in ("proxyWallet", "maker_address", "taker_address",
-                              "maker", "owner", "user"):
-                    addr = row.get(field) or ""
-                    if addr:
-                        wallets.add(str(addr).lower())
-            logger.info("data-api /activity → added %d wallets (total=%d)",
-                        len(wallets) - before, len(wallets))
-        await asyncio.sleep(0.3)
+        # ── SOURCE 2: Data API /activity — try multiple variants (400 fix) ───
+        # The endpoint is finicky about the 'type' param; try in order.
+        activity_attempts = [
+            ("https://data-api.polymarket.com/activity",
+             {"limit": 500, "type": "TRADE", "minSize": 500}),
+            ("https://data-api.polymarket.com/activity",
+             {"limit": 500}),
+            ("https://data-api.polymarket.com/trades",
+             {"limit": 500}),
+        ]
+        for act_url, act_params in activity_attempts:
+            status, data = await self.client.data.fetch_raw(act_url, act_params)
+            rows = _as_rows(data)
+            logger.info(
+                "activity attempt %s params=%s → status=%d, records=%d",
+                act_url, act_params, status, len(rows),
+            )
+            if status < 400 and rows:
+                if rows:
+                    logger.info("activity sample keys: %s", list(rows[0].keys()))
+                    logger.info("activity sample object: %s", rows[0])
+                before = len(wallets)
+                for row in rows:
+                    wallets |= _extract_eth_addresses(row)
+                logger.info(
+                    "activity source → extracted %d addresses (total=%d)",
+                    len(wallets) - before, len(wallets),
+                )
+                break  # stop at first successful variant
+            await asyncio.sleep(0.3)
 
         # ── SOURCE 3: Gamma API profiles ──────────────────────────────────────
         gamma_prof_url = "https://gamma-api.polymarket.com/profiles"
         status, data = await self.client.data.fetch_raw(
             gamma_prof_url, {"limit": 100}
         )
-        logger.info("gamma /profiles → status=%d, records=%s", status,
-                    len(data) if isinstance(data, list) else
-                    (len(data.get("data", [])) if isinstance(data, dict) else "none"))
-        if data:
-            rows = data if isinstance(data, list) else data.get("data", [])
-            before = len(wallets)
-            for row in (rows or []):
-                addr = (row.get("proxyWallet") or row.get("address")
-                        or row.get("user") or "")
-                if addr:
-                    wallets.add(str(addr).lower())
-            logger.info("gamma /profiles → added %d wallets (total=%d)",
-                        len(wallets) - before, len(wallets))
+        rows = _as_rows(data)
+        logger.info("gamma /profiles → status=%d, records=%d", status, len(rows))
+        if rows:
+            logger.info("gamma profiles sample keys: %s", list(rows[0].keys()))
+            logger.info("gamma profiles sample object: %s", rows[0])
+        before = len(wallets)
+        for row in rows:
+            wallets |= _extract_eth_addresses(row)
+        logger.info("gamma /profiles → extracted %d addresses (total=%d)",
+                    len(wallets) - before, len(wallets))
         await asyncio.sleep(0.3)
 
         # ── SOURCE 4: Data API leaderboard windows ────────────────────────────
@@ -131,50 +135,45 @@ class WhaleTracker:
             status, data = await self.client.data.fetch_raw(
                 lb_url, {"window": window, "limit": 100, "sort": "profit"}
             )
-            logger.info("data-api /leaderboard?window=%s → status=%d, records=%s",
-                        window, status,
-                        len(data) if isinstance(data, list) else
-                        (len(data.get("data", data.get("leaderboard", [])))
-                         if isinstance(data, dict) else "none"))
-            if data:
-                rows = (data if isinstance(data, list)
-                        else data.get("data", data.get("leaderboard",
-                        data.get("results", []))))
-                before = len(wallets)
-                for row in (rows or []):
-                    addr = (row.get("proxyWallet") or row.get("proxy_address")
-                            or row.get("address") or row.get("user")
-                            or row.get("wallet") or "")
-                    if addr:
-                        wallets.add(str(addr).lower())
-                logger.info("leaderboard window=%s → added %d wallets (total=%d)",
-                            window, len(wallets) - before, len(wallets))
+            rows = _as_rows(data)
+            logger.info("leaderboard window=%s → status=%d, records=%d",
+                        window, status, len(rows))
+            if rows:
+                logger.info("leaderboard sample keys: %s", list(rows[0].keys()))
+                logger.info("leaderboard sample object: %s", rows[0])
+            before = len(wallets)
+            for row in rows:
+                wallets |= _extract_eth_addresses(row)
+            logger.info("leaderboard window=%s → extracted %d addresses (total=%d)",
+                        window, len(wallets) - before, len(wallets))
             await asyncio.sleep(0.4)
 
-        # ── SOURCE 5: Data API trades (broadest fallback, minSize=100) ────────
+        # ── SOURCE 5: Data API trades (broadest fallback) ─────────────────────
         if len(wallets) < 10:
             logger.warning(
-                "Only %d wallets from primary sources — fetching /trades?minSize=100",
+                "Only %d wallets from primary sources — fetching data-api /trades",
                 len(wallets),
             )
             dt_url = "https://data-api.polymarket.com/trades"
             status, data = await self.client.data.fetch_raw(
                 dt_url, {"limit": 1000, "minSize": 100}
             )
-            logger.info("data-api /trades?minSize=100 → status=%d, records=%s",
-                        status, len(data) if isinstance(data, list) else
-                        (len(data.get("data", [])) if isinstance(data, dict) else "none"))
-            if data:
-                rows = data if isinstance(data, list) else data.get("data", [])
-                before = len(wallets)
-                for t in (rows or []):
-                    for field in ("maker_address", "taker_address", "maker",
-                                  "taker", "owner"):
-                        addr = t.get(field) or ""
-                        if addr:
-                            wallets.add(str(addr).lower())
-                logger.info("data-api /trades → added %d wallets (total=%d)",
-                            len(wallets) - before, len(wallets))
+            rows = _as_rows(data)
+            logger.info("data-api /trades?minSize=100 → status=%d, records=%d",
+                        status, len(rows))
+            if rows:
+                logger.info("data-api trades sample keys: %s", list(rows[0].keys()))
+                logger.info("data-api trades sample object: %s", rows[0])
+            before = len(wallets)
+            for row in rows:
+                wallets |= _extract_eth_addresses(row)
+            logger.info("data-api /trades → extracted %d addresses (total=%d)",
+                        len(wallets) - before, len(wallets))
+
+        logger.info(
+            "Wallet discovery complete: %d unique 0x addresses found across all sources",
+            len(wallets),
+        )
 
         # ── No wallets at all — log clearly and bail without fake data ────────
         if not wallets:
@@ -544,6 +543,37 @@ class WhaleTracker:
         score = min(10.0, conviction + boost)
         direction = net_dir if net_dir != "NEUTRAL" else "NEUTRAL"
         return score, direction
+
+
+def _extract_eth_addresses(obj) -> set[str]:
+    """
+    Recursively walk any dict/list/value and collect every Ethereum address.
+    An address is any string starting with '0x' that is exactly 42 characters
+    long (20 bytes hex-encoded). This is field-name-agnostic: it works
+    regardless of how the API labels the address field.
+    """
+    found: set[str] = set()
+    if isinstance(obj, str):
+        if len(obj) == 42 and obj.startswith("0x"):
+            found.add(obj.lower())
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            found |= _extract_eth_addresses(v)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            found |= _extract_eth_addresses(item)
+    return found
+
+
+def _as_rows(data) -> list:
+    """Normalise an API response (list, dict-with-data-key, or None) to a list."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("data", "results", "leaderboard", "trades", "activity"):
+            if key in data and isinstance(data[key], list):
+                return data[key]
+    return []
 
 
 def _majority(directions: list[str]) -> str:
