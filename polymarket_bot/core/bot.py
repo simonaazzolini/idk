@@ -153,6 +153,76 @@ class PolymarketBot:
             asyncio.create_task(self.whale_tracker.full_refresh(), name="whale_refresh")
             logger.info("Whale database refresh started in background")
 
+        # Smoke test: immediately paper trade $20 on highest-volume market to
+        # verify the full execution path works end-to-end before the first cycle.
+        await self._run_smoke_test()
+
+    async def _run_smoke_test(self) -> None:
+        """
+        One-time startup smoke test: paper trade $20 on the highest-volume
+        active market to confirm the execution path works end-to-end.
+        Errors are caught so they never block startup.
+        """
+        print("SMOKE TEST TRADE: fetching markets for smoke test...")
+        try:
+            raw_markets = await self.client.gamma.get_all_active_markets()
+            if not raw_markets:
+                print("SMOKE TEST TRADE: no markets returned, skipping")
+                return
+            # Pick the highest-volume active market with a YES token
+            candidates = [
+                m for m in raw_markets
+                if m.get("active") and not m.get("closed")
+                and extract_yes_no_token_ids(m)[0]
+            ]
+            if not candidates:
+                print("SMOKE TEST TRADE: no eligible markets found, skipping")
+                return
+            candidates.sort(
+                key=lambda m: float(m.get("volume24hr") or m.get("volume_24h") or 0),
+                reverse=True,
+            )
+            target = candidates[0]
+            yes_token, _ = extract_yes_no_token_ids(target)
+            slug = target.get("slug") or target.get("conditionId", "smoke-test")
+            yes_price, _ = extract_yes_no_prices(target)
+            if yes_price <= 0:
+                yes_price = 0.5
+
+            smoke_signal = TradeSignal(
+                market_slug=slug,
+                question=target.get("question", "Smoke test market"),
+                category=get_market_category(target),
+                current_price=yes_price,
+                final_direction="YES",
+                action="BUY",
+                composite_score=6.0,
+                ai_score=6.0,
+                whale_score=5.0,
+                news_score=5.0,
+                technical_score=6.0,
+                orderbook_score=5.0,
+                ai_probability=yes_price,
+                ai_edge=0.05,
+                ai_confidence=0.7,
+            )
+            print(f"SMOKE TEST TRADE: executing $20 paper BUY on {slug[:40]} (YES @ {yes_price:.3f})")
+            result = await self.executor.execute_signal(
+                signal=smoke_signal,
+                size_usdc=20.0,
+                mode="PAPER",
+                portfolio_state=self.portfolio.state.to_dict(),
+                market=target,
+                token_id=yes_token,
+            )
+            print(f"SMOKE TEST TRADE: result success={result.success} order_id={result.order_id} reason={result.reason}")
+            if result.success:
+                await self.portfolio.on_trade_opened(result.trade_id, 20.0, result.fill_price)
+                logger.info("SMOKE TEST TRADE executed: %s success=%s fill=%.4f", slug, result.success, result.fill_price)
+        except Exception as exc:
+            print(f"SMOKE TEST TRADE: ERROR — {exc}")
+            logger.warning("Smoke test trade failed (non-fatal): %s", exc, exc_info=True)
+
     async def run(self) -> None:
         """Main bot loop."""
         self._running = True
@@ -214,6 +284,7 @@ class PolymarketBot:
             return
         self._current_markets = markets
         self.dashboard.markets_tracked = len(markets)
+        print(f"[CYCLE] STEP1 markets_discovered={len(markets)} top_slug={markets[0].get('slug','?')[:30] if markets else 'NONE'}")
 
         # Check paper/live timer
         await self._check_paper_timer()
@@ -222,6 +293,7 @@ class PolymarketBot:
         can_trade, halt_reason = self.portfolio.can_trade()
         if not can_trade:
             self._diag["why_no_trades"] = f"Trading halted: {halt_reason}"
+        print(f"[CYCLE] STEP1b can_trade={can_trade} halt_reason={halt_reason if not can_trade else 'ok'}")
 
         # Update whale wallet count diagnostic
         try:
@@ -232,9 +304,11 @@ class PolymarketBot:
 
         # Step 2: Fetch orderbooks for all markets
         await self._fetch_orderbooks(markets)
+        print(f"[CYCLE] STEP2 orderbooks_fetched={len(self._current_orderbooks)}")
 
         # Step 3: Compute technical indicators
         await self._compute_technicals(markets)
+        print(f"[CYCLE] STEP3 technical_signals={len(self._technical_signals)}")
 
         # Step 4: Check whale positions
         await self.whale_tracker.refresh_positions(markets)
@@ -244,10 +318,12 @@ class PolymarketBot:
             slug = market.get("slug") or market.get("conditionId", "")
             consensus = await self.whale_tracker.get_smart_money_consensus(slug)
             self._whale_consensuses[slug] = consensus
+        print(f"[CYCLE] STEP4 whale_consensuses={len(self._whale_consensuses)}")
 
         # Step 5: Check whale new trades (alerts)
         market_slugs = [m.get("slug") or m.get("conditionId", "") for m in markets[:20]]
         whale_alerts = await self.whale_tracker.poll_new_trades(market_slugs)
+        print(f"[CYCLE] STEP5 whale_alerts={len(whale_alerts)}")
         if whale_alerts:
             logger.info("Processing %d whale alerts", len(whale_alerts))
             for alert in whale_alerts:
@@ -258,6 +334,7 @@ class PolymarketBot:
         # Step 6: News analysis (top 20 markets)
         if can_trade:
             self._news_results = await self.news_analyzer.analyze_batch(markets[:20])
+        print(f"[CYCLE] STEP6 news_results={len(self._news_results)} can_trade={can_trade}")
 
         # Step 7: AI analysis (max 10 markets per cycle — rate limit budget)
         if can_trade:
@@ -269,6 +346,7 @@ class PolymarketBot:
                 news_results=self._news_results,
                 mode=self.mode,
             )
+        print(f"[CYCLE] STEP7 ai_results={len(self._ai_results)} ai_available={self.ai_analyzer.ai_available}")
 
         # Step 8: Arb scan
         days_map = {
@@ -289,6 +367,7 @@ class PolymarketBot:
         else:
             logger.info("Arb scan: 0 opportunities found (orderbooks fetched: %d)",
                         len(self._current_orderbooks))
+        print(f"[CYCLE] STEP8 arb_opportunities={len(self._arb_opportunities)} types={[a.arb_type for a in self._arb_opportunities[:5]]}")
 
         # Execute arb opportunities — completely independent of Anthropic availability.
         # Gated only on portfolio safety (can_trade), NOT on AI/news status.
@@ -353,6 +432,7 @@ class PolymarketBot:
         else:
             logger.info("ARB execution skipped: can_trade=False")
         self._diag["arb_executed"] = _arb_executed
+        print(f"[CYCLE] STEP8b arb_executed={_arb_executed} can_trade={can_trade}")
 
         # Step 9-11: Aggregate signals, size, execute
         if can_trade:
@@ -393,6 +473,8 @@ class PolymarketBot:
                 ai_available=self.ai_analyzer.ai_available,
                 news_available=self.news_analyzer.news_available,
             )
+            _buy_signals = [s for s in signals if s.action in ("STRONG_BUY", "BUY", "WEAK_BUY")]
+            print(f"[CYCLE] STEP9 signals_total={len(signals)} buy_signals={len(_buy_signals)} actions={[s.action for s in signals[:10]]}")
 
             # Update dashboard
             self.dashboard.recent_signals = signals
@@ -434,9 +516,11 @@ class PolymarketBot:
                             f"{signal.market_slug[:20]}: {signal.reason_skipped}"
                         )
                     continue
+                print(f"[CYCLE] STEP10 CALLING _execute_signal slug={signal.market_slug[:30]} action={signal.action} score={signal.composite_score:.2f} dir={signal.final_direction}")
                 await self._execute_signal(signal, markets)
                 _trades_executed += 1
 
+            print(f"[CYCLE] STEP10b trades_executed={_trades_executed} sigs_logged={_sigs_logged} no_trade_reasons={_no_trade_reasons[:3]}")
             self._diag["signals_logged"] = _sigs_logged
             self._diag["trades_executed"] = _trades_executed
             self._diag["markets_analyzed"] = len(signals)

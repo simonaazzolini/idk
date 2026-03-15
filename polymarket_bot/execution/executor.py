@@ -222,6 +222,7 @@ class OrderExecutor:
         signal: TradeSignal,
     ) -> ExecutionResult:
         """Simulate a paper trade fill at mid + 0.3% slippage."""
+        print(f"EXECUTOR REACHED _simulate_paper_fill slug={signal.market_slug[:30]} outcome={outcome} size=${size_usdc:.2f} price={signal.current_price:.4f}")
         fill_price = min(0.99, signal.current_price * (1 + self.settings.paper_slippage_pct))
         slippage = fill_price - signal.current_price
         shares = size_usdc / fill_price if fill_price > 0 else 0
