@@ -256,39 +256,41 @@ class ClobApiClient:
             return None
 
     async def get_orderbooks(self, token_ids) -> dict:
-        """Fetch multiple order books in a batch using BookParams."""
+        """
+        Fetch orderbooks one token at a time using BookParams.
+        Per-token loop is more reliable than batch — avoids order-mismatch bugs.
+        Returns {token_id: {"bids": [{"price":..,"size":..}, ..], "asks": [..]}}
+        """
         if not self._client:
             return {}
-        try:
-            clean_ids = []
-            for t in token_ids:
-                if t is None:
-                    continue
-                if isinstance(t, str) and t and t != 'None':
-                    clean_ids.append(t)
-            if not clean_ids:
-                return {}
-            from py_clob_client.clob_types import BookParams
-            params = [BookParams(token_id=str(tid)) for tid in clean_ids]
-            loop = asyncio.get_event_loop()
-            books = await loop.run_in_executor(
-                None, self._client.get_order_books, params
-            )
-            result = {}
-            for tid, book in zip(clean_ids, books or []):
-                if book:
-                    result[tid] = {
+        from py_clob_client.clob_types import BookParams
+        loop = asyncio.get_event_loop()
+        result = {}
+        for tid in token_ids:
+            if not tid or not isinstance(tid, str) or tid == 'None':
+                continue
+            try:
+                books = await loop.run_in_executor(
+                    None,
+                    self._client.get_order_books,
+                    [BookParams(token_id=str(tid))],
+                )
+                if books and books[0]:
+                    book = books[0]
+                    result[str(tid)] = {
                         "bids": [{"price": float(b.price), "size": float(b.size)}
                                  for b in (book.bids or [])],
                         "asks": [{"price": float(a.price), "size": float(a.size)}
                                  for a in (book.asks or [])],
                     }
-            return result
-        except Exception as e:
-            logger.error("Batch orderbook error: %s", e)
-            return {}
+            except Exception as e:
+                err = str(e)
+                if "404" not in err and "No orderbook" not in err:
+                    logger.debug("Orderbook error %s: %s", tid[:20], e)
+                continue
+        return result
 
-    # Keep alias so any future callers still work
+    # Alias kept for any callers using the old name
     async def get_order_books_batch(self, token_ids) -> dict:
         return await self.get_orderbooks(token_ids)
 

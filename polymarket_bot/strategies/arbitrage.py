@@ -46,34 +46,49 @@ class ArbitrageDetector:
         market: dict,
         yes_book: Optional[OrderbookMetrics],
         no_book: Optional[OrderbookMetrics],
+        paper_mode: bool = False,
     ) -> Optional[ArbOpportunity]:
         """
-        Buy both YES and NO simultaneously if yes_ask + no_ask < 0.985.
+        Buy both YES and NO simultaneously if yes_ask + no_ask < 1.0.
+        Threshold: arb_min_profit_pct (0.5% live, 0.3% paper).
         """
+        slug = market.get("slug") or market.get("conditionId", "unknown")
+
         if not yes_book or not no_book:
+            logger.debug("ARB_SKIP %s: missing orderbook (yes=%s no=%s)",
+                         slug[:30], bool(yes_book), bool(no_book))
             return None
 
         yes_ask = yes_book.best_ask
         no_ask = no_book.best_ask
 
         if yes_ask <= 0 or no_ask <= 0:
+            logger.debug("ARB_SKIP %s: zero ask (yes_ask=%.4f no_ask=%.4f)",
+                         slug[:30], yes_ask, no_ask)
             return None
 
         yes_no_sum = yes_ask + no_ask
         arb_gap = 1.0 - yes_no_sum
+        min_pct = (getattr(self.settings, 'arb_paper_min_profit_pct', 0.003)
+                   if paper_mode else self.settings.arb_min_profit_pct)
 
-        if arb_gap <= self.settings.arb_min_profit_pct:
+        if arb_gap <= min_pct:
+            logger.debug("ARB_SKIP %s: gap=%.4f (%.2f%%) below min=%.4f (%.2f%%) | sum=%.4f",
+                         slug[:30], arb_gap, arb_gap*100, min_pct, min_pct*100, yes_no_sum)
             return None
 
         profit_pct = arb_gap
-        # Max size limited by depth on both sides
-        yes_depth = yes_book.ask_depth_1pct
-        no_depth = no_book.ask_depth_1pct
+        # Max size limited by depth — use at least $20 minimum per side
+        yes_depth = max(yes_book.ask_depth_1pct, 20.0)
+        no_depth = max(no_book.ask_depth_1pct, 20.0)
         max_size = min(yes_depth, no_depth, 500.0)
-        max_size_usdc = max_size  # in USDC (price * shares)
+        max_size_usdc = max_size
 
         profit_usdc = max_size_usdc * profit_pct
-        if profit_usdc < self.settings.arb_min_profit_usdc:
+        min_profit = (0.10 if paper_mode else self.settings.arb_min_profit_usdc)
+        if profit_usdc < min_profit:
+            logger.debug("ARB_SKIP %s: profit_usdc=%.2f below min=%.2f (size=%.1f pct=%.4f)",
+                         slug[:30], profit_usdc, min_profit, max_size, profit_pct)
             return None
 
         slug = market.get("slug") or market.get("conditionId", "unknown")
@@ -301,6 +316,7 @@ class ArbitrageDetector:
         markets: list[dict],
         orderbooks: dict[str, dict],  # token_id → raw book
         days_to_resolution_map: dict[str, float],  # slug → days
+        paper_mode: bool = False,
     ) -> list[ArbOpportunity]:
         """
         Run all arb type scans and return all detected opportunities.
@@ -328,10 +344,12 @@ class ArbitrageDetector:
 
                 # Type 1
                 if yes_metrics and no_metrics:
-                    t1 = self.detect_yes_no_arb(market, yes_metrics, no_metrics)
+                    t1 = self.detect_yes_no_arb(market, yes_metrics, no_metrics, paper_mode=paper_mode)
                     if t1:
                         opportunities.append(t1)
-                        logger.info("TYPE_1 ARB: %s profit=%.1f%%", slug[:30], t1.profit_pct * 100)
+                        logger.info("TYPE_1 ARB FOUND: %s profit=%.2f%% ($%.2f) yes_ask=%.4f no_ask=%.4f",
+                                    slug[:30], t1.profit_pct * 100, t1.profit_usdc,
+                                    yes_metrics.best_ask, no_metrics.best_ask)
 
                 # Type 4
                 if yes_metrics:

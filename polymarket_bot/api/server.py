@@ -919,6 +919,47 @@ class APIServer:
             await _execute(db, f"UPDATE {table} SET status='CLOSE_PENDING', exit_reason='manual_close' WHERE market_slug=? AND status='OPEN'", (slug,))
             return {"success": True, "message": f"Position {slug} queued for close"}
 
+        # ── Debug / health report ─────────────────────────────────────────────
+
+        @app.get("/api/debug")
+        async def debug_report():
+            """Return a full health/diagnostic report for the last cycle."""
+            bot = server_self.bot_ref
+            diag = getattr(bot, "_diag", {}) if bot else {}
+
+            # Pull fresh counts from DB
+            mode = await _scalar(db, "SELECT value FROM bot_state WHERE key='mode'") or "PAPER"
+            table = "paper_trades" if mode == "PAPER" else "trades"
+            today_start = time.time() - 86400
+            trades_today   = await _scalar(db,
+                f"SELECT COUNT(*) FROM {table} WHERE timestamp >= ?", (today_start,)) or 0
+            signals_today  = await _scalar(db,
+                "SELECT COUNT(*) FROM signals WHERE timestamp >= ?", (today_start,)) or 0
+            whale_wallets  = await _scalar(db,
+                "SELECT COUNT(*) FROM whale_wallets") or 0
+            arb_today      = await _scalar(db,
+                "SELECT COUNT(*) FROM arb_trades WHERE timestamp >= ? AND executed=1",
+                (today_start,)) or 0
+
+            return {
+                "last_cycle_duration_seconds": diag.get("last_cycle_duration_s", 0),
+                "markets_analyzed_last_cycle": diag.get("markets_analyzed", 0),
+                "ai_calls_last_cycle":         diag.get("ai_calls", 0),
+                "ai_signals_generated":        diag.get("ai_signals_generated", 0),
+                "arb_opportunities_found":     diag.get("arb_found", 0),
+                "arb_opportunities_executed":  diag.get("arb_executed", 0),
+                "orderbooks_fetched_ok":       diag.get("orderbooks_ok", 0),
+                "orderbooks_failed":           diag.get("orderbooks_failed", 0),
+                "whale_wallets_tracked":       whale_wallets,
+                "signals_logged_today":        signals_today,
+                "trades_executed_today":       trades_today,
+                "arb_executed_today":          arb_today,
+                "current_mode":                mode,
+                "why_no_trades":               diag.get("why_no_trades", "No cycle run yet"),
+                "bot_running":                 bool(bot and getattr(bot, "_running", False)),
+                "cycle_count":                 getattr(bot, "_cycle_count", 0) if bot else 0,
+            }
+
         # ── Logs ──────────────────────────────────────────────────────────────
 
         @app.get("/api/logs")

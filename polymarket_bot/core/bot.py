@@ -94,6 +94,21 @@ class PolymarketBot:
         self._api_calls_today: int = 0
         self._paper_start_ts: float = 0.0
         self._paper_evaluated_at: float = 0.0
+        # Diagnostic counters — reset each cycle, exposed via /api/debug
+        self._diag: dict = {
+            "last_cycle_duration_s": 0.0,
+            "markets_analyzed": 0,
+            "ai_calls": 0,
+            "ai_signals_generated": 0,
+            "arb_found": 0,
+            "arb_executed": 0,
+            "orderbooks_ok": 0,
+            "orderbooks_failed": 0,
+            "whale_wallets": 0,
+            "signals_logged": 0,
+            "trades_executed": 0,
+            "why_no_trades": "Starting up",
+        }
 
     async def startup(self) -> None:
         """Initialize everything and prepare for trading."""
@@ -199,6 +214,15 @@ class PolymarketBot:
 
         # Stop if trading halted
         can_trade, halt_reason = self.portfolio.can_trade()
+        if not can_trade:
+            self._diag["why_no_trades"] = f"Trading halted: {halt_reason}"
+
+        # Update whale wallet count diagnostic
+        try:
+            tracked = await self.db.get_all_tracked_wallets()
+            self._diag["whale_wallets"] = len(tracked)
+        except Exception:
+            pass
 
         # Step 2: Fetch orderbooks for all markets
         await self._fetch_orderbooks(markets)
@@ -246,16 +270,39 @@ class PolymarketBot:
             for m in markets
         }
         self._arb_opportunities = self.arb_detector.scan_all(
-            markets, self._current_orderbooks, days_map
+            markets, self._current_orderbooks, days_map,
+            paper_mode=(self.mode == "PAPER"),
         )
+        self._diag["arb_found"] = len(self._arb_opportunities)
+        if self._arb_opportunities:
+            logger.info(
+                "Arb scan: %d opportunities found. Types: %s",
+                len(self._arb_opportunities),
+                [a.arb_type for a in self._arb_opportunities[:5]],
+            )
+        else:
+            logger.info("Arb scan: 0 opportunities found (orderbooks fetched: %d)",
+                        len(self._current_orderbooks))
 
         # Execute immediately-actionable arb opportunities
+        _arb_executed = 0
         if can_trade:
-            for arb in self._arb_opportunities[:3]:  # top 3 only
-                if arb.arb_type in ("TYPE_1_YES_NO_SUM", "TYPE_2_CATEGORICAL"):
+            for arb in self._arb_opportunities[:5]:  # top 5 (was 3)
+                # In paper mode: execute any arb > 0.3%; live: TYPE_1/TYPE_2 only
+                if self.mode == "PAPER" and arb.profit_pct >= 0.003:
                     await self.executor.execute_arb(
                         arb, self.mode, self.portfolio.state.to_dict()
                     )
+                    _arb_executed += 1
+                elif arb.arb_type in ("TYPE_1_YES_NO_SUM", "TYPE_2_CATEGORICAL"):
+                    await self.executor.execute_arb(
+                        arb, self.mode, self.portfolio.state.to_dict()
+                    )
+                    _arb_executed += 1
+                else:
+                    logger.debug("ARB not executed: type=%s profit=%.3f%% mode=%s",
+                                 arb.arb_type, arb.profit_pct * 100, self.mode)
+        self._diag["arb_executed"] = _arb_executed
 
         # Step 9-11: Aggregate signals, size, execute
         if can_trade:
@@ -299,11 +346,54 @@ class PolymarketBot:
             self.dashboard.recent_signals = signals
             self.dashboard.portfolio_state = self.portfolio.state
 
-            # Execute actionable signals
+            # Log ALL signals to DB (including SKIP) so the signals tab shows data
+            _sigs_logged = 0
+            _trades_executed = 0
+            _no_trade_reasons: list[str] = []
             for signal in signals:
+                try:
+                    await self.db.insert_signal({
+                        "timestamp": signal.computed_at,
+                        "market_slug": signal.market_slug,
+                        "question": signal.question,
+                        "ai_probability": signal.ai_probability,
+                        "market_price": signal.current_price,
+                        "ai_edge": signal.ai_edge,
+                        "whale_score": signal.whale_score,
+                        "whale_direction": signal.whale_direction,
+                        "news_score": signal.news_score,
+                        "news_direction": signal.news_direction,
+                        "technical_score": signal.technical_score,
+                        "technical_direction": signal.technical_direction,
+                        "orderbook_score": signal.orderbook_score,
+                        "arb_score": signal.arb_score,
+                        "composite_score": signal.composite_score,
+                        "final_direction": signal.final_direction,
+                        "action_taken": signal.action,
+                        "reason_skipped": signal.reason_skipped,
+                    })
+                    _sigs_logged += 1
+                except Exception as _e:
+                    logger.debug("Failed to log signal to DB: %s", _e)
+
                 if signal.action not in ("STRONG_BUY", "BUY", "WEAK_BUY"):
+                    if signal.reason_skipped:
+                        _no_trade_reasons.append(
+                            f"{signal.market_slug[:20]}: {signal.reason_skipped}"
+                        )
                     continue
                 await self._execute_signal(signal, markets)
+                _trades_executed += 1
+
+            self._diag["signals_logged"] = _sigs_logged
+            self._diag["trades_executed"] = _trades_executed
+            self._diag["markets_analyzed"] = len(signals)
+            ai_hits = sum(1 for s in signals if abs(s.ai_edge) > 0)
+            self._diag["ai_signals_generated"] = ai_hits
+            if _trades_executed == 0 and _no_trade_reasons:
+                self._diag["why_no_trades"] = "; ".join(_no_trade_reasons[:3])
+            elif _trades_executed > 0:
+                self._diag["why_no_trades"] = f"Executed {_trades_executed} trade(s) this cycle"
 
         # Step 12: Log daily performance
         await self._log_daily_performance()
@@ -404,10 +494,14 @@ class PolymarketBot:
             return
 
         try:
-            books = await self.client.clob.get_order_books_batch(token_ids)
+            books = await self.client.clob.get_orderbooks(token_ids)
             self._current_orderbooks.update(books)
-            logger.debug("Fetched orderbooks for %d tokens", len(books))
+            self._diag["orderbooks_ok"] = len(books)
+            self._diag["orderbooks_failed"] = len(token_ids) - len(books)
+            logger.info("Orderbooks fetched: %d/%d tokens succeeded",
+                        len(books), len(token_ids))
         except Exception as e:
+            self._diag["orderbooks_failed"] = len(token_ids)
             logger.warning("Orderbook batch fetch failed: %s", e)
 
         # Subscribe new tokens to WebSocket

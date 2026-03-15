@@ -37,12 +37,12 @@ class Settings:
     # ── Trading Parameters ────────────────────────────────────────────────────
     budget: float = 1000.0
     max_position_size: float = 100.0
-    min_edge: float = 0.04
+    min_edge: float = 0.02
     cycle_minutes: int = 15
 
     # ── Market Filters ────────────────────────────────────────────────────────
-    min_liquidity: float = field(default_factory=lambda: float(os.getenv("MIN_LIQUIDITY", "500")))
-    min_volume: float = field(default_factory=lambda: float(os.getenv("MIN_VOLUME", "1000")))
+    min_liquidity: float = field(default_factory=lambda: float(os.getenv("MIN_LIQUIDITY", "100")))
+    min_volume: float = field(default_factory=lambda: float(os.getenv("MIN_VOLUME", "200")))
     min_days_to_resolution: float = 1.0
     max_days_to_resolution: float = 180.0
     top_markets_count: int = 50
@@ -64,7 +64,7 @@ class Settings:
     max_category_pct: float = 0.30       # max 30% in one category
     max_total_exposure_pct: float = 0.80 # max 80% deployed
     max_open_positions: int = 10
-    kelly_multiplier: float = 0.25       # quarter Kelly, never increase
+    kelly_multiplier: float = 0.20       # fifth Kelly — reduced from 0.25 to generate more trades
 
     # ── Paper Trading ─────────────────────────────────────────────────────────
     paper_trading_hours: float = 48.0
@@ -84,8 +84,9 @@ class Settings:
     copy_trade_stop_loss_pct: float = 0.20   # tighter than own trades
 
     # ── Arb Settings ──────────────────────────────────────────────────────────
-    arb_min_profit_pct: float = 0.015    # min 1.5% gap for Type 1 arb
-    arb_min_profit_usdc: float = 5.0
+    arb_min_profit_pct: float = 0.005    # min 0.5% gap for Type 1 arb (was 1.5%)
+    arb_min_profit_usdc: float = 0.50   # reduced from $5 to enable more paper arbs
+    arb_paper_min_profit_pct: float = 0.003  # even lower for paper mode (0.3%)
     spread_capture_min_spread_pct: float = 0.03
 
     # ── Order Execution ───────────────────────────────────────────────────────
@@ -93,7 +94,7 @@ class Settings:
     order_cancel_timeout_seconds: int = 1800   # cancel GTC after 30 min
     iceberg_tranche_size: float = 75.0
     iceberg_delay_seconds: int = 30
-    min_position_size_usdc: float = 5.0
+    min_position_size_usdc: float = 2.0
 
     # ── Logging & DB ─────────────────────────────────────────────────────────
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))

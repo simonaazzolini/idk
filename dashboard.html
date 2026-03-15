@@ -319,6 +319,28 @@
         </div>
       </div>
 
+      <!-- Bot Diagnostics card -->
+      <div class="card" id="diag-card">
+        <h3>Bot Diagnostics <span class="dim" style="font-size:11px;text-transform:none;font-weight:400">(last cycle)</span></h3>
+        <div style="display:flex;flex-direction:column;gap:6px;font-size:13px">
+          <div style="display:flex;justify-content:space-between"><span class="dim">Markets analyzed</span><span id="diag-markets">—</span></div>
+          <div style="display:flex;justify-content:space-between"><span class="dim">AI calls</span><span id="diag-ai-calls">—</span></div>
+          <div style="display:flex;justify-content:space-between"><span class="dim">AI signals (any edge)</span><span id="diag-ai-sigs">—</span></div>
+          <div style="display:flex;justify-content:space-between"><span class="dim">Arb opportunities found</span><span id="diag-arb-found">—</span></div>
+          <div style="display:flex;justify-content:space-between"><span class="dim">Arb executed</span><span id="diag-arb-exec">—</span></div>
+          <div style="display:flex;justify-content:space-between"><span class="dim">Orderbooks OK</span><span id="diag-ob-ok">—</span></div>
+          <div style="display:flex;justify-content:space-between"><span class="dim">Orderbooks failed</span><span id="diag-ob-fail">—</span></div>
+          <div style="display:flex;justify-content:space-between"><span class="dim">Whale wallets tracked</span><span id="diag-whales">—</span></div>
+          <div style="display:flex;justify-content:space-between"><span class="dim">Signals logged today</span><span id="diag-sigs-today">—</span></div>
+          <div style="display:flex;justify-content:space-between"><span class="dim">Trades executed today</span><span id="diag-trades-today">—</span></div>
+          <div style="display:flex;justify-content:space-between"><span class="dim">Total cycles</span><span id="diag-cycles">—</span></div>
+          <div style="margin-top:6px;padding-top:6px;border-top:1px solid #21262d">
+            <span class="dim" style="font-size:11px">Why no trades:</span>
+            <div id="diag-why" style="font-size:11px;color:#d29922;margin-top:3px;word-break:break-word">—</div>
+          </div>
+        </div>
+      </div>
+
       <!-- Live event feed -->
       <div class="card">
         <h3>Live Events <span class="dim" style="font-size:11px;text-transform:none;font-weight:400">(WebSocket)</span></h3>
@@ -974,6 +996,26 @@ async function loadOverview() {
   $('st-api').textContent = status.api_calls_today ?? '—';
   $('st-db').textContent  = status.db_size_mb != null ? status.db_size_mb.toFixed(1) + ' MB' : '—';
   $('st-cycles').textContent = status.cycles_completed ?? '—';
+
+  // ── Bot diagnostics card ────────────────────────────────────────────────
+  const diag = await apiFetch('/api/debug');
+  if (diag && $('diag-card')) {
+    const ok = v => v > 0 ? `<span class="green">${v}</span>` : `<span class="red">${v}</span>`;
+    $('diag-markets').textContent     = diag.markets_analyzed_last_cycle ?? '—';
+    $('diag-ai-calls').textContent    = diag.ai_calls_last_cycle ?? '—';
+    $('diag-ai-sigs').textContent     = diag.ai_signals_generated ?? '—';
+    $('diag-arb-found').textContent   = diag.arb_opportunities_found ?? '—';
+    $('diag-arb-exec').innerHTML      = ok(diag.arb_opportunities_executed ?? 0);
+    $('diag-ob-ok').innerHTML         = ok(diag.orderbooks_fetched_ok ?? 0);
+    $('diag-ob-fail').innerHTML       = diag.orderbooks_failed > 0
+      ? `<span class="red">${diag.orderbooks_failed}</span>`
+      : `<span class="dim">${diag.orderbooks_failed ?? 0}</span>`;
+    $('diag-whales').innerHTML        = ok(diag.whale_wallets_tracked ?? 0);
+    $('diag-sigs-today').textContent  = diag.signals_logged_today ?? '—';
+    $('diag-trades-today').innerHTML  = ok(diag.trades_executed_today ?? 0);
+    $('diag-why').textContent         = diag.why_no_trades || '—';
+    $('diag-cycles').textContent      = diag.cycle_count ?? '—';
+  }
 }
 
 // ── Positions

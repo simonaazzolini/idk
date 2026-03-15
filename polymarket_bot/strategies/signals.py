@@ -232,24 +232,24 @@ class SignalAggregator:
         if arb_score >= 9.0:
             sig.action = "STRONG_BUY"
             sig.final_direction = "YES"  # Arb specific legs handled elsewhere
-        elif sig.composite_score >= 8.0 and abs_edge >= 0.08:
+        elif sig.composite_score >= 5.5 and abs_edge >= 0.04:
             sig.action = "STRONG_BUY"
             if ai_edge < 0:
                 sig.final_direction = "NO"
-        elif sig.composite_score >= 6.5 and abs_edge >= 0.05:
+        elif sig.composite_score >= 4.0 and abs_edge >= 0.02:
             sig.action = "BUY"
             if ai_edge < 0:
                 sig.final_direction = "NO"
-        elif sig.composite_score >= 5.0 and abs_edge >= 0.04:
+        elif sig.composite_score >= 3.0 and abs_edge >= 0.01:
             sig.action = "WEAK_BUY"
             if ai_edge < 0:
                 sig.final_direction = "NO"
         else:
             sig.action = "SKIP"
             reasons = []
-            if abs_edge < 0.04:
+            if abs_edge < 0.01:
                 reasons.append(f"edge too small ({ai_edge:+.3f})")
-            if sig.composite_score < 5.0:
+            if sig.composite_score < 3.0:
                 reasons.append(f"score too low ({sig.composite_score:.1f})")
             sig.reason_skipped = ", ".join(reasons) or "insufficient signal"
 
@@ -263,10 +263,19 @@ class SignalAggregator:
                 sig.action = "SKIP"
                 sig.reason_skipped = f"Only {agreeing_signals}/6 signals agree on {sig.final_direction}"
 
-            # AI confidence must be >= 0.55
-            if sig.ai_confidence < 0.55:
+            # AI confidence must be >= 0.40 (was 0.55)
+            if sig.ai_confidence < 0.40:
                 sig.action = "SKIP"
                 sig.reason_skipped = f"AI confidence too low ({sig.ai_confidence:.2f})"
+
+        # ── Data flow diagnostic log ──────────────────────────────────────────
+        logger.info(
+            "SIGNAL %s | score=%.2f | ai_prob=%.3f | edge=%+.3f | conf=%.2f"
+            " | whale=%s(%.1f) | action=%s%s",
+            slug[:30], sig.composite_score, sig.ai_probability, sig.ai_edge,
+            sig.ai_confidence, sig.whale_direction, sig.whale_score, sig.action,
+            f" | skip={sig.reason_skipped}" if sig.action == "SKIP" else "",
+        )
 
         return sig
 

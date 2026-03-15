@@ -310,12 +310,21 @@ class AIAnalyzer:
 
         await self.cache.set_ai_analysis(slug, result.to_dict(), ttl_seconds=900)
 
+        tag = "DEEP" if use_deep_model else "HAIKU"
+        action_hint = ""
+        if abs(result.edge) < 0.01:
+            action_hint = " → BELOW_THRESHOLD (edge<0.01)"
+        elif abs(result.edge) < 0.02:
+            action_hint = " → WEAK_SIGNAL"
         logger.info(
-            "AI [%s]: %s | P(YES)=%.3f | edge=%.3f | conf=%.2f | signal=%s",
-            "DEEP" if use_deep_model else "HAIKU",
-            slug[:30], result.yes_probability, result.edge,
-            result.confidence, result.signal_strength,
+            "AI [%s] %s | market_price=%.3f P(YES)=%.3f edge=%+.3f conf=%.2f "
+            "signal=%s outcome=%s%s",
+            tag, slug[:30], current_price, result.yes_probability, result.edge,
+            result.confidence, result.signal_strength, result.recommended_outcome,
+            action_hint,
         )
+        if result.reasoning:
+            logger.debug("AI reasoning [%s]: %s", slug[:20], result.reasoning[:200])
         return result
 
     async def analyze_batch(
