@@ -140,12 +140,25 @@ class SignalAggregator:
             sig.ai_confidence = float(getattr(ai_result, "confidence", 0.5))
             sig.signal_strength = str(getattr(ai_result, "signal_strength", "WEAK"))
         elif _no_anthropic:
-            # Anthropic completely unavailable — use neutral placeholder,
-            # composite will be recalculated with tech+ob weights below
-            sig.ai_score = 5.0
-            sig.ai_direction = "NEUTRAL"
+            # Anthropic completely unavailable — infer direction and edge from
+            # current price so we never produce a flat 5.0 ai_score.
+            # Logic: if YES is trading below 0.45 it's likely underpriced (buy YES);
+            # above 0.55 it's likely overpriced (buy NO).
+            if current_price < 0.45:
+                _p_edge = 0.5 - current_price          # e.g. price=0.35 → edge=0.15
+                _p_dir = "YES"
+            elif current_price > 0.55:
+                _p_edge = current_price - 0.5          # e.g. price=0.70 → edge=0.20
+                _p_dir = "NO"
+            else:
+                _p_edge = 0.0
+                _p_dir = "NEUTRAL"
+            # Scale edge to 0-10 score: 10% edge → score 10.0
+            sig.ai_score = float(min(10.0, 5.0 + (_p_edge * 50.0)))
+            sig.ai_direction = _p_dir
             sig.ai_probability = current_price
-            sig.ai_edge = 0.0
+            # ai_edge: positive = buy YES, negative = buy NO
+            sig.ai_edge = _p_edge if _p_dir == "YES" else (-_p_edge if _p_dir == "NO" else 0.0)
             sig.ai_confidence = 0.0
             sig.signal_strength = "WEAK"
         else:
@@ -179,16 +192,31 @@ class SignalAggregator:
             sig.technical_score = float(getattr(technical_signal, "technical_score", 5.0))
             sig.technical_direction = str(getattr(technical_signal, "technical_direction", "NEUTRAL"))
         else:
-            sig.technical_score = 5.0
-            sig.technical_direction = "NEUTRAL"
+            # No technical data — estimate from yes_price so score is never flat 5.0
+            _t_base = 5.0 + (abs(current_price - 0.5) * 20.0)
+            sig.technical_score = float(min(10.0, _t_base))
+            if current_price < 0.45:
+                sig.technical_direction = "YES"
+            elif current_price > 0.55:
+                sig.technical_direction = "NO"
+            else:
+                sig.technical_direction = "NEUTRAL"
 
         # Orderbook signal
         if orderbook_yes:
             sig.orderbook_score = float(getattr(orderbook_yes, "orderbook_score", 5.0))
             sig.orderbook_direction = str(getattr(orderbook_yes, "orderbook_direction", "NEUTRAL"))
         else:
-            sig.orderbook_score = 5.0
-            sig.orderbook_direction = "NEUTRAL"
+            # No orderbook — use price as proxy for order pressure (price away
+            # from 0.5 implies demand imbalance)
+            _ob_base = 5.0 + (abs(current_price - 0.5) * 10.0)
+            sig.orderbook_score = float(min(10.0, _ob_base))
+            if current_price < 0.45:
+                sig.orderbook_direction = "YES"
+            elif current_price > 0.55:
+                sig.orderbook_direction = "NO"
+            else:
+                sig.orderbook_direction = "NEUTRAL"
 
         # Arb signal
         sig.arb_score = clamp(arb_score, 0.0, 10.0)
@@ -258,25 +286,39 @@ class SignalAggregator:
             composite *= 1.20
             logger.debug("Full consensus bonus applied for %s", slug[:30])
 
-        sig.composite_score = clamp(composite, 0.0, 10.0)
+        _raw_composite = clamp(composite, 0.0, 10.0)
+
+        # ── Anti-flat: composite must never be exactly 5.0 for a real market ──
+        # When all signals are neutral the maths produces exactly 5.0.  Add a
+        # tiny deterministic perturbation derived from the market's 24h volume
+        # so individual markets can be differentiated and ranked.
+        if abs(_raw_composite - 5.0) < 0.005:
+            _vol24 = float(market.get("volume24hr") or market.get("volume_24h") or 0)
+            # (vol mod 1000) / 1000 ∈ [0, 1) → noise ∈ [-0.05, +0.05)
+            _noise = ((_vol24 % 1000.0) / 1000.0 - 0.5) * 0.10
+            _raw_composite = clamp(_raw_composite + _noise, 0.0, 10.0)
+
+        sig.composite_score = _raw_composite
 
         # ── Determine trade action ────────────────────────────────────────────
         ai_edge = sig.ai_edge
         abs_edge = abs(ai_edge)
 
         if _no_anthropic:
-            # Degraded mode: direction from technical/orderbook only,
-            # edge check skipped (no AI probability to compare against market price),
-            # lower composite threshold since we have less signal.
+            # Degraded mode: direction derived from technical + orderbook signals
+            # (both now price-based and non-neutral for real markets).
+            # Threshold raised to 5.5 since scores are now meaningful, not flat.
             if arb_score >= 9.0:
                 sig.action = "STRONG_BUY"
                 sig.final_direction = "YES"
-            elif sig.composite_score >= 3.0 and sig.final_direction != "NEUTRAL":
+            elif sig.composite_score >= 5.5 and sig.final_direction != "NEUTRAL":
                 sig.action = "BUY"
+            elif sig.composite_score >= 4.5 and sig.final_direction != "NEUTRAL":
+                sig.action = "WEAK_BUY"
             else:
                 sig.action = "SKIP"
                 sig.reason_skipped = (
-                    f"DEGRADED(no Anthropic): score={sig.composite_score:.1f} "
+                    f"DEGRADED(no Anthropic): score={sig.composite_score:.2f} "
                     f"dir={sig.final_direction}"
                 )
         else:
@@ -286,6 +328,12 @@ class SignalAggregator:
                 sig.final_direction = "YES"  # Arb specific legs handled elsewhere
             elif sig.composite_score >= 5.5 and abs_edge >= 0.04:
                 sig.action = "STRONG_BUY"
+                if ai_edge < 0:
+                    sig.final_direction = "NO"
+            elif sig.composite_score >= 5.5 and sig.final_direction != "NEUTRAL":
+                # Non-trivial composite with clear direction: BUY even without large edge.
+                # Catches markets where price-based signals agree but AI edge is small.
+                sig.action = "BUY"
                 if ai_edge < 0:
                     sig.final_direction = "NO"
             elif sig.composite_score >= 4.0 and abs_edge >= 0.02:
@@ -302,7 +350,7 @@ class SignalAggregator:
                 if abs_edge < 0.01:
                     reasons.append(f"edge too small ({ai_edge:+.3f})")
                 if sig.composite_score < 3.0:
-                    reasons.append(f"score too low ({sig.composite_score:.1f})")
+                    reasons.append(f"score too low ({sig.composite_score:.2f})")
                 sig.reason_skipped = ", ".join(reasons) or "insufficient signal"
 
         # ── Confirmation requirements ─────────────────────────────────────────

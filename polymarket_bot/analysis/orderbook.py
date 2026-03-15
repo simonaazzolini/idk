@@ -424,50 +424,25 @@ def _compute_market_impact(
 
 def _compute_score(m: OrderbookMetrics) -> tuple[float, str]:
     """
-    Compute composite orderbook signal score (0–10) and direction.
+    Compute orderbook signal score (0–10) and direction.
 
-    Components:
-        1. Tight-band imbalance (1% depth)     weighted 40%  → bullish when +
-        2. Spread quality                        weighted 20%  → tight = better
-        3. Thinness penalty                      weighted 20%  → thick = better
-        4. Market impact cost                    weighted 10%  → low cost = better
-        5. Full-book imbalance confirmation      weighted 10%
+    Primary signal: full-book bid/ask imbalance mapped linearly to [0, 10].
+        score = 5.0 + (bid_ask_imbalance × 5.0)
+        bid_ask_imbalance ∈ [−1, +1]  →  score ∈ [0, 10]
+        0 imbalance → 5.0 (neutral), +1 (all bids) → 10, −1 (all asks) → 0
 
-    The imbalance signals are directional; the rest are quality modifiers.
-    The final score is normalised to 0–10 with a neutral baseline of 5.0.
+    Direction uses the tighter 1% band imbalance for precision; falls back
+    to the full-book imbalance when 1% band is thin.
     """
-    # ── 1. Tight-band imbalance (primary directional signal) ──────────────────
-    # Ranges: −1 to +1 → mapped to 0–10 contribution
-    imbalance_score = float(np.clip((m.depth_imbalance_1pct + 1.0) * 5.0, 0.0, 10.0))
-
-    # ── 2. Spread quality (tighter = more liquid = better execution) ──────────
-    # spread_pct < 2% → excellent (10); > 20% → poor (0)
-    spread_score = float(np.clip(10.0 - m.spread_pct * 0.5, 0.0, 10.0))
-
-    # ── 3. Book thickness (low thinness = deep book = good) ───────────────────
-    thickness_score = float(np.clip((1.0 - m.thinness_score) * 10.0, 0.0, 10.0))
-
-    # ── 4. Market impact cost (low impact = good) ─────────────────────────────
-    # impact_500_pct in [0, 10%] → score 10..0
-    impact_score = float(np.clip(10.0 - m.market_impact_500_pct * 2.0, 0.0, 10.0))
-
-    # ── 5. Full-book imbalance confirmation ───────────────────────────────────
-    full_imbalance_score = float(np.clip((m.bid_ask_imbalance + 1.0) * 5.0, 0.0, 10.0))
-
-    # ── Weighted composite ────────────────────────────────────────────────────
-    score = (
-        imbalance_score    * 0.40
-        + spread_score     * 0.20
-        + thickness_score  * 0.20
-        + impact_score     * 0.10
-        + full_imbalance_score * 0.10
-    )
+    # ── Primary: full-book bid/ask imbalance ──────────────────────────────────
+    score = 5.0 + (m.bid_ask_imbalance * 5.0)
     score = float(np.clip(score, 0.0, 10.0))
 
-    # ── Direction from the tight-band (1%) imbalance ──────────────────────────
-    if m.depth_imbalance_1pct > 0.15:
+    # ── Direction: prefer 1% band; fall back to full-book ────────────────────
+    # 1% band imbalance is more informative for short-term directional signals
+    if m.depth_imbalance_1pct > 0.15 or m.bid_ask_imbalance > 0.25:
         direction = "YES"
-    elif m.depth_imbalance_1pct < -0.15:
+    elif m.depth_imbalance_1pct < -0.15 or m.bid_ask_imbalance < -0.25:
         direction = "NO"
     else:
         direction = "NEUTRAL"

@@ -701,8 +701,10 @@ class PolymarketBot:
                 else:
                     history = cached
 
+                # Pass empty list when no history — compute_technical_signals
+                # will compute a price-based score instead of returning flat 5.0
                 if not history:
-                    continue
+                    history = []
 
                 yes_price = float(market.get("yes_price") or 0.5)
                 volume_24h = float(market.get("volume24hr") or market.get("volume_24h") or 0)

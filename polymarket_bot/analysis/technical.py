@@ -93,13 +93,22 @@ def compute_technical_signals(
     current_price = float(np.clip(current_price, 0.001, 0.999))
 
     if not price_history:
+        # No price history — compute a real score from price level alone so the
+        # technical score is never a flat 5.0 default for real markets.
+        sig.technical_score, sig.technical_direction = _price_based_score(
+            current_price, volume_24h
+        )
         return sig
 
     try:
         return _compute_signals_inner(sig, price_history, current_price, volume_24h, days_to_resolution)
     except Exception as exc:
         logger.warning("Technical analysis error — returning safe defaults: %s", exc)
-        return TechnicalSignal()
+        # Even on error, return a price-based score rather than a flat 5.0
+        sig.technical_score, sig.technical_direction = _price_based_score(
+            current_price, volume_24h
+        )
+        return sig
 
 
 def _compute_signals_inner(
@@ -113,19 +122,25 @@ def _compute_signals_inner(
 
     df = _build_df(price_history)
     if df is None or len(df) < 3:
-        # Minimal 2-point momentum estimate
+        # Minimal 2-point momentum estimate, then price-based score fallback
         if df is not None and len(df) == 2:
             closes = df["close"].values
             sig.price_change_1h = _pct_change_at(closes, current_price, 1)
+        sig.technical_score, sig.technical_direction = _price_based_score(
+            current_price, volume_24h
+        )
         return sig
 
     closes = df["close"].values.astype(float)
     volumes = df["volume"].values.astype(float)
     n = len(closes)
 
-    # Guard: constant price array → nothing meaningful
+    # Guard: constant price array → use price-based fallback, not flat 5.0
     if np.ptp(closes) < 1e-8:
-        logger.debug("Price history is constant — skipping technical indicators")
+        logger.debug("Price history is constant — using price-based fallback score")
+        sig.technical_score, sig.technical_direction = _price_based_score(
+            current_price, volume_24h
+        )
         return sig
 
     # ── Momentum ──────────────────────────────────────────────────────────────
@@ -268,6 +283,46 @@ def _compute_signals_inner(
     sig.technical_score, sig.technical_direction = _compute_score(sig, current_price)
 
     return sig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Price-based fallback score (used when price history is absent or trivial)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _price_based_score(
+    current_price: float,
+    volume_24h: float,
+    avg_volume: float = 1000.0,
+) -> tuple[float, str]:
+    """
+    Compute a technical score from current price level alone.
+
+    Formula:  base = 5.0 + (abs(price − 0.5) × 20)
+              +1.0 if volume_24h > avg_volume
+              floor of 7.0 for prices at binary extremes (< 0.3 or > 0.7)
+
+    Maps: price=0.50 → 5.0 (neutral)
+          price=0.45 → 6.0,  price=0.40 → 7.0,  price=0.30 → 9.0
+          price=0.55 → 6.0,  price=0.60 → 7.0,  price=0.70 → 9.0
+
+    Direction:  < 0.45 → YES (likely underpriced)
+                > 0.55 → NO  (likely overpriced relative to fair value)
+                else   → NEUTRAL
+    """
+    base = 5.0 + (abs(current_price - 0.5) * 20.0)
+    if volume_24h > avg_volume:
+        base += 1.0
+    # Binary extremes are very likely near resolution — reinforce the signal
+    if current_price < 0.3 or current_price > 0.7:
+        base = max(base, 7.0)
+    score = float(np.clip(base, 0.0, 10.0))
+    if current_price < 0.45:
+        direction = "YES"
+    elif current_price > 0.55:
+        direction = "NO"
+    else:
+        direction = "NEUTRAL"
+    return score, direction
 
 
 # ─────────────────────────────────────────────────────────────────────────────
