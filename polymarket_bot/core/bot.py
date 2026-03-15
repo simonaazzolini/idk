@@ -300,27 +300,58 @@ class PolymarketBot:
             logger.info(
                 "Anthropic unavailable this cycle — arb execution proceeds independently"
             )
+
+        # Count truly executable arbs (have legs, not signal-only TYPE_5)
+        _executable_arbs = [
+            a for a in self._arb_opportunities
+            if len(a.legs) > 0 and a.arb_type != "TYPE_5_TIME_DECAY"
+        ]
+        logger.info(
+            "ARB results: %d total, %d executable (with legs, non-TYPE_5), can_trade=%s",
+            len(self._arb_opportunities), len(_executable_arbs), can_trade,
+        )
+
         if can_trade:
             for arb in self._arb_opportunities[:5]:
-                # Paper mode: execute any arb >= 0.3%
-                # Live mode: execute TYPE_1/TYPE_2 only (mechanical arb, no AI needed)
-                # Extra condition: profit must be >= 0.5% to match user requirement
-                profit_ok = arb.profit_pct >= 0.005
+                # TYPE_5 is signal-only — no legs, cannot execute
+                if arb.arb_type == "TYPE_5_TIME_DECAY" or not arb.legs:
+                    logger.info(
+                        "ARB SKIP %s %s: signal-only / no legs (profit=%.4f)",
+                        arb.arb_type, arb.market_slug[:25], arb.profit_pct,
+                    )
+                    continue
+
+                # Paper mode: execute any arb with legs >= 0.3%
                 if self.mode == "PAPER" and arb.profit_pct >= 0.003:
+                    logger.info(
+                        "ARB EXECUTE (paper): %s %s profit=%.4f (%.2f%%)",
+                        arb.arb_type, arb.market_slug[:25],
+                        arb.profit_pct, arb.profit_pct * 100,
+                    )
                     await self.executor.execute_arb(
                         arb, self.mode, self.portfolio.state.to_dict()
                     )
                     _arb_executed += 1
-                elif profit_ok and arb.arb_type in ("TYPE_1_YES_NO_SUM", "TYPE_2_CATEGORICAL"):
+                # Live mode: execute TYPE_1/TYPE_2 only (mechanical arb, no AI needed)
+                elif arb.profit_pct >= 0.005 and arb.arb_type in ("TYPE_1_YES_NO_SUM", "TYPE_2_CATEGORICAL"):
+                    logger.info(
+                        "ARB EXECUTE (live): %s %s profit=%.4f (%.2f%%)",
+                        arb.arb_type, arb.market_slug[:25],
+                        arb.profit_pct, arb.profit_pct * 100,
+                    )
                     await self.executor.execute_arb(
                         arb, self.mode, self.portfolio.state.to_dict()
                     )
                     _arb_executed += 1
                 else:
-                    logger.debug(
-                        "ARB not executed: type=%s profit=%.3f%% (>=0.5%%=%s) mode=%s",
-                        arb.arb_type, arb.profit_pct * 100, profit_ok, self.mode,
+                    logger.info(
+                        "ARB SKIP %s %s: profit=%.4f (%.2f%%) below threshold "
+                        "(paper_min=0.3%% live_min=0.5%%) mode=%s",
+                        arb.arb_type, arb.market_slug[:25],
+                        arb.profit_pct, arb.profit_pct * 100, self.mode,
                     )
+        else:
+            logger.info("ARB execution skipped: can_trade=False")
         self._diag["arb_executed"] = _arb_executed
 
         # Step 9-11: Aggregate signals, size, execute

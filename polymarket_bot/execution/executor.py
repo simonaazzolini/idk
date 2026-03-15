@@ -344,6 +344,11 @@ class OrderExecutor:
         """
         Execute an arbitrage opportunity (FOK market orders for Type 1/2).
         """
+        logger.info(
+            "ENTERING EXECUTOR: execute_arb type=%s market=%s profit=%.4f (%.2f%%) legs=%d mode=%s",
+            arb.arb_type, arb.market_slug[:30], arb.profit_pct, arb.profit_pct * 100,
+            len(arb.legs), mode,
+        )
         if not arb.legs:
             return ExecutionResult(False, None, 0, 0, 0, mode, reason="No legs defined", is_paper=(mode == "PAPER"))
 

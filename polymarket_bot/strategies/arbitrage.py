@@ -347,21 +347,36 @@ class ArbitrageDetector:
                     t1 = self.detect_yes_no_arb(market, yes_metrics, no_metrics, paper_mode=paper_mode)
                     if t1:
                         opportunities.append(t1)
-                        logger.info("TYPE_1 ARB FOUND: %s profit=%.2f%% ($%.2f) yes_ask=%.4f no_ask=%.4f",
-                                    slug[:30], t1.profit_pct * 100, t1.profit_usdc,
-                                    yes_metrics.best_ask, no_metrics.best_ask)
+                        logger.info(
+                            "ARB FOUND TYPE_1: %s profit=%.4f (%.2f%%) $%.2f legs=%d executable=YES",
+                            slug[:30], t1.profit_pct, t1.profit_pct * 100,
+                            t1.profit_usdc, len(t1.legs),
+                        )
 
                 # Type 4
                 if yes_metrics:
                     t4 = self.detect_spread_capture(market, yes_metrics)
                     if t4:
                         opportunities.append(t4)
+                        logger.info(
+                            "ARB FOUND TYPE_4: %s profit=%.4f (%.2f%%) $%.2f legs=%d executable=YES",
+                            slug[:30], t4.profit_pct, t4.profit_pct * 100,
+                            t4.profit_usdc, len(t4.legs),
+                        )
 
-                # Type 5
+                # Type 5 — signal only, no legs, not directly executable
                 days = days_to_resolution_map.get(slug, 30.0)
                 t5 = self.detect_time_decay_arb(market, days)
                 if t5:
                     opportunities.append(t5)
+                    logger.info(
+                        "ARB FOUND TYPE_5: %s profit=%.4f legs=%d executable=NO "
+                        "(signal-only, needs AI — %.1fh to resolution price=%.3f)",
+                        slug[:30], t5.profit_pct, len(t5.legs),
+                        days * 24,
+                        float((market.get("outcomePrices") or [0.5])[0]
+                              if isinstance(market.get("outcomePrices"), list) else 0.5),
+                    )
 
             except Exception as exc:
                 logger.debug("Arb scan error for market %s: %s", slug, exc)
