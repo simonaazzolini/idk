@@ -247,38 +247,50 @@ class ClobApiClient:
             book = await loop.run_in_executor(None, self._client.get_order_book, token_id)
             return self._normalize_book(book)
         except Exception as e:
-            logger.warning("Failed to fetch orderbook for %s: %s", token_id, e)
+            err_str = str(e)
+            # 404 means no active orderbook for this token — not an error
+            if "404" in err_str or "No orderbook exists" in err_str:
+                logger.debug("No orderbook for token %s (404), skipping", token_id)
+            else:
+                logger.warning("Failed to fetch orderbook for %s: %s", token_id, e)
             return None
 
-    async def get_order_books_batch(self, token_ids: list[str]) -> dict[str, dict]:
-        """Fetch multiple order books in a batch."""
-        self._require_init()
-        loop = asyncio.get_event_loop()
-        results: dict[str, dict] = {}
-        # Batch in groups of 20
-        for i in range(0, len(token_ids), 20):
-            batch = token_ids[i : i + 20]
-            try:
-                books = await loop.run_in_executor(
-                    None, self._client.get_order_books, batch
-                )
-                if isinstance(books, list):
-                    for book in books:
-                        tid = book.get("asset_id") or book.get("token_id", "")
-                        if tid:
-                            results[str(tid)] = self._normalize_book(book)
-                elif isinstance(books, dict):
-                    for tid, book in books.items():
-                        results[str(tid)] = self._normalize_book(book)
-            except Exception as e:
-                logger.warning("Batch orderbook fetch failed: %s", e)
-                # Fall back to individual fetches
-                for tid in batch:
-                    book = await self.get_order_book(tid)
-                    if book:
-                        results[tid] = book
-            await asyncio.sleep(0.2)
-        return results
+    async def get_orderbooks(self, token_ids) -> dict:
+        """Fetch multiple order books in a batch using BookParams."""
+        if not self._client:
+            return {}
+        try:
+            clean_ids = []
+            for t in token_ids:
+                if t is None:
+                    continue
+                if isinstance(t, str) and t and t != 'None':
+                    clean_ids.append(t)
+            if not clean_ids:
+                return {}
+            from py_clob_client.clob_types import BookParams
+            params = [BookParams(token_id=str(tid)) for tid in clean_ids]
+            loop = asyncio.get_event_loop()
+            books = await loop.run_in_executor(
+                None, self._client.get_order_books, params
+            )
+            result = {}
+            for tid, book in zip(clean_ids, books or []):
+                if book:
+                    result[tid] = {
+                        "bids": [{"price": float(b.price), "size": float(b.size)}
+                                 for b in (book.bids or [])],
+                        "asks": [{"price": float(a.price), "size": float(a.size)}
+                                 for a in (book.asks or [])],
+                    }
+            return result
+        except Exception as e:
+            logger.error("Batch orderbook error: %s", e)
+            return {}
+
+    # Keep alias so any future callers still work
+    async def get_order_books_batch(self, token_ids) -> dict:
+        return await self.get_orderbooks(token_ids)
 
     def _normalize_book(self, raw: Any) -> dict:
         """Normalize a raw order book object into a consistent dict."""

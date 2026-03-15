@@ -99,6 +99,11 @@ class PolymarketBot:
         """Initialize everything and prepare for trading."""
         logger.info("Bot starting up in %s mode with budget=$%.2f", self.mode, self.budget)
 
+        # Write the current mode to DB immediately so that _check_db_commands
+        # (which fires every 5 s) does not see a stale STOPPED value from a
+        # previous session and halt the bot before it finishes starting up.
+        await self.db.set_state("mode", self.mode)
+
         # Initialize portfolio
         await self.portfolio.initialize()
 
@@ -232,7 +237,7 @@ class PolymarketBot:
                 technical_signals=self._technical_signals,
                 whale_consensuses=self._whale_consensuses,
                 news_results=self._news_results,
-                mode=self._mode,
+                mode=self.mode,
             )
 
         # Step 8: Arb scan
