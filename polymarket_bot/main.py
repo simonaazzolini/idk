@@ -2,11 +2,29 @@
 Main entry point — Module 14.
 CLI for starting the Polymarket trading bot.
 """
+import sys
+import io
+
+# Fix bad file descriptor on restart — must happen before any other imports
+# that may write to stdout/stderr.
+try:
+    sys.stdout.flush()
+except Exception:
+    pass
+try:
+    sys.stderr.flush()
+except Exception:
+    pass
+# Redirect broken streams to devnull so logging doesn't raise on restart
+if sys.stdout is None or sys.stdout.fileno() < 0:
+    sys.stdout = open('/dev/null', 'w')
+if sys.stderr is None or sys.stderr.fileno() < 0:
+    sys.stderr = open('/dev/null', 'w')
+
 import argparse
 import asyncio
 import logging
 import signal
-import sys
 from pathlib import Path
 
 # Add parent dir to path so imports work when run from project root
