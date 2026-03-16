@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TJR Bot Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <!-- Chart.js from CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <!-- ===== TOP BAR ===== -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="bot-name">TJR BOT</span>
+      <span class="live-indicator" id="liveIndicator">
+        <span class="dot" id="liveDot"></span>
+        <span id="liveLabel">CONNECTING</span>
+      </span>
+    </div>
+    <div class="topbar-symbols">
+      <span class="sym active" id="symDisplay">XAUUSD</span>
+    </div>
+    <div class="topbar-time" id="clockDisplay">--:--:-- EST</div>
+  </header>
+
+  <!-- ===== STAT CARDS ===== -->
+  <section class="stat-cards">
+    <div class="card">
+      <div class="card-label">BALANCE</div>
+      <div class="card-value" id="statBalance">$--,---</div>
+    </div>
+    <div class="card">
+      <div class="card-label">EQUITY</div>
+      <div class="card-value" id="statEquity">$--,---</div>
+    </div>
+    <div class="card">
+      <div class="card-label">DAILY P&amp;L</div>
+      <div class="card-value neutral" id="statDailyPnL">+0.00%</div>
+    </div>
+    <div class="card">
+      <div class="card-label">WIN RATE</div>
+      <div class="card-value" id="statWinRate">--%</div>
+    </div>
+    <div class="card">
+      <div class="card-label">PROFIT FACTOR</div>
+      <div class="card-value" id="statProfitFactor">--</div>
+    </div>
+  </section>
+
+  <!-- ===== EQUITY CURVE ===== -->
+  <section class="chart-section">
+    <div class="chart-header">EQUITY CURVE</div>
+    <canvas id="equityChart"></canvas>
+  </section>
+
+  <!-- ===== MIDDLE ROW ===== -->
+  <section class="mid-row">
+    <!-- Bot Status Panel -->
+    <div class="panel status-panel">
+      <div class="panel-title">BOT STATUS</div>
+      <div class="status-box">
+        <div class="status-row">
+          <span class="status-label">Phase</span>
+          <span class="status-val phase-tag" id="stPhase">IDLE</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">Session</span>
+          <span class="status-val" id="stSession">--</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">HTF Bias</span>
+          <span class="status-val" id="stBias">--</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">Sweep</span>
+          <span class="status-val" id="stSweep">Watching...</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">M5 BOS</span>
+          <span class="status-val" id="stBOS">Pending...</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">Checklist</span>
+          <span class="status-val" id="stChecklist">0/8</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">Trades Today</span>
+          <span class="status-val" id="stTrades">0/3</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 8-Factor Checklist -->
+    <div class="panel checklist-panel">
+      <div class="panel-title">8-FACTOR CHECKLIST</div>
+      <ul class="checklist" id="checklistItems">
+        <li id="chk0" class="chk-item pending"><span class="chk-num">①</span><span class="chk-name">Session Active</span><span class="chk-status">⏳</span><span class="chk-detail" id="chkD0">Waiting</span></li>
+        <li id="chk1" class="chk-item pending"><span class="chk-num">②</span><span class="chk-name">HTF Bias</span><span class="chk-status">⏳</span><span class="chk-detail" id="chkD1">Waiting</span></li>
+        <li id="chk2" class="chk-item pending"><span class="chk-num">③</span><span class="chk-name">Liquidity Sweep</span><span class="chk-status">⏳</span><span class="chk-detail" id="chkD2">Watching</span></li>
+        <li id="chk3" class="chk-item pending"><span class="chk-num">④</span><span class="chk-name">BOS / MSS</span><span class="chk-status">⏳</span><span class="chk-detail" id="chkD3">Waiting</span></li>
+        <li id="chk4" class="chk-item pending"><span class="chk-num">⑤</span><span class="chk-name">Fair Value Gap</span><span class="chk-status">⏳</span><span class="chk-detail" id="chkD4">Not yet</span></li>
+        <li id="chk5" class="chk-item pending"><span class="chk-num">⑥</span><span class="chk-name">Order Block</span><span class="chk-status">⏳</span><span class="chk-detail" id="chkD5">Not yet</span></li>
+        <li id="chk6" class="chk-item pending"><span class="chk-num">⑦</span><span class="chk-name">SMT Divergence</span><span class="chk-status">○</span><span class="chk-detail" id="chkD6">Optional</span></li>
+        <li id="chk7" class="chk-item pending"><span class="chk-num">⑧</span><span class="chk-name">79% Fib Ext</span><span class="chk-status">⏳</span><span class="chk-detail" id="chkD7">Not yet</span></li>
+      </ul>
+      <div class="checklist-bar-wrap">
+        <div class="checklist-bar">
+          <div class="checklist-bar-fill" id="checklistBarFill" style="width:0%"></div>
+        </div>
+        <span class="checklist-score-lbl" id="checklistScoreLbl">Score: 0/8</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== OPEN POSITION ===== -->
+  <section class="panel position-panel" id="positionPanel">
+    <div class="panel-title">OPEN POSITION</div>
+    <div id="positionContent" class="no-position">No active position</div>
+  </section>
+
+  <!-- ===== CHARTS ROW ===== -->
+  <section class="charts-row">
+    <div class="panel mini-chart-panel">
+      <div class="panel-title">WIN / LOSS</div>
+      <canvas id="winLossChart"></canvas>
+    </div>
+    <div class="panel mini-chart-panel">
+      <div class="panel-title">R DISTRIBUTION</div>
+      <canvas id="rDistChart"></canvas>
+    </div>
+    <div class="panel mini-chart-panel">
+      <div class="panel-title">SESSION PERFORMANCE</div>
+      <canvas id="sessionChart"></canvas>
+    </div>
+  </section>
+
+  <!-- ===== BOTTOM ROW ===== -->
+  <section class="bottom-row">
+    <!-- Session Levels -->
+    <div class="panel levels-panel">
+      <div class="panel-title">SESSION LEVELS</div>
+      <table class="levels-table">
+        <tr><td>Prev Day H</td><td class="level-val bear" id="lvPDH">--</td></tr>
+        <tr><td>Prev Day L</td><td class="level-val bull" id="lvPDL">--</td></tr>
+        <tr><td>Asia High</td><td class="level-val bear" id="lvAsiaH">--</td></tr>
+        <tr><td>Asia Low</td><td class="level-val bull" id="lvAsiaL">--</td></tr>
+        <tr><td>London High</td><td class="level-val bear" id="lvLonH">--</td></tr>
+        <tr><td>London Low</td><td class="level-val bull" id="lvLonL">--</td></tr>
+        <tr><td>H4 Swing H</td><td class="level-val bear" id="lvH4H">--</td></tr>
+        <tr><td>H4 Swing L</td><td class="level-val bull" id="lvH4L">--</td></tr>
+      </table>
+    </div>
+
+    <!-- Risk Monitor -->
+    <div class="panel risk-panel">
+      <div class="panel-title">RISK MONITOR</div>
+      <div class="risk-item">
+        <span class="risk-label">Daily Loss Used</span>
+        <div class="risk-bar-wrap">
+          <div class="risk-bar"><div class="risk-fill danger" id="riskDailyFill" style="width:0%"></div></div>
+          <span class="risk-val" id="riskDailyVal">0 / 1.5R</span>
+        </div>
+      </div>
+      <div class="risk-item">
+        <span class="risk-label">Trades Today</span>
+        <div class="risk-bar-wrap">
+          <div class="risk-bar"><div class="risk-fill warn" id="riskTradesFill" style="width:0%"></div></div>
+          <span class="risk-val" id="riskTradesVal">0 / 3</span>
+        </div>
+      </div>
+      <div class="risk-item">
+        <span class="risk-label">Consec Losses</span>
+        <div class="risk-bar-wrap">
+          <div class="risk-bar"><div class="risk-fill danger" id="riskConsecFill" style="width:0%"></div></div>
+          <span class="risk-val" id="riskConsecVal">0 / 2</span>
+        </div>
+      </div>
+      <div class="risk-item">
+        <span class="risk-label">Risk Per Trade</span>
+        <span class="risk-static" id="riskPerTrade">0.5%</span>
+      </div>
+      <div class="risk-item">
+        <span class="risk-label">Max Drawdown</span>
+        <span class="risk-static danger" id="riskMaxDD">--</span>
+      </div>
+      <div class="risk-item">
+        <span class="risk-label">MT5 Status</span>
+        <span class="risk-static" id="riskMT5Status">--</span>
+      </div>
+    </div>
+
+    <!-- Recent Trades -->
+    <div class="panel trades-panel">
+      <div class="panel-title">RECENT TRADES</div>
+      <table class="trades-table">
+        <thead>
+          <tr>
+            <th>DATE/TIME</th><th>SYM</th><th>DIR</th>
+            <th>ENTRY</th><th>EXIT</th><th>R</th><th>USD</th>
+          </tr>
+        </thead>
+        <tbody id="tradesBody">
+          <tr><td colspan="7" class="no-data">No trade history</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
