@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bayesian Market Bot</title>
+<style>
+  :root {
+    --bg: #0d0d0f;
+    --bg2: #141418;
+    --bg3: #1a1a20;
+    --border: #2a2a35;
+    --accent: #6c63ff;
+    --accent2: #00d4aa;
+    --green: #00c97a;
+    --red: #ff4757;
+    --yellow: #ffa502;
+    --text: #e8e8f0;
+    --text2: #9090a8;
+    --text3: #606075;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Consolas', monospace; font-size: 13px; }
+
+  /* Layout */
+  .header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 20px; position: sticky; top: 0; z-index: 100; }
+  .header h1 { font-size: 16px; color: var(--accent); letter-spacing: 1px; }
+  .mode-badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; letter-spacing: 1px; }
+  .mode-paper { background: #1a3a2a; color: var(--accent2); border: 1px solid var(--accent2); }
+  .mode-live { background: #3a1a1a; color: var(--red); border: 1px solid var(--red); }
+  .price-chip { background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 4px 12px; font-size: 12px; }
+  .price-chip span { color: var(--text2); }
+  .price-chip strong { color: var(--accent2); }
+  .balance-chip { background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 4px 12px; font-size: 12px; }
+  .balance-chip span { color: var(--text2); }
+  .balance-chip strong { color: var(--green); }
+  .last-update { margin-left: auto; color: var(--text3); font-size: 11px; }
+
+  /* Main grid */
+  .main { padding: 16px 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .full-width { grid-column: 1 / -1; }
+
+  /* Cards */
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .card-header { padding: 10px 16px; background: var(--bg3); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+  .card-title { font-size: 11px; font-weight: bold; color: var(--text2); letter-spacing: 1.5px; text-transform: uppercase; }
+  .card-body { padding: 16px; }
+
+  /* Stats row */
+  .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .stat-box { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 12px; text-align: center; }
+  .stat-label { font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+  .stat-value { font-size: 20px; font-weight: bold; }
+  .stat-sub { font-size: 10px; color: var(--text3); margin-top: 2px; }
+  .green { color: var(--green); }
+  .red { color: var(--red); }
+  .yellow { color: var(--yellow); }
+  .accent { color: var(--accent); }
+
+  /* Positions table */
+  table { width: 100%; border-collapse: collapse; }
+  th { font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: 1px; padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+  td { padding: 8px; border-bottom: 1px solid #1e1e28; font-size: 12px; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--bg3); }
+  .empty-state { text-align: center; padding: 32px; color: var(--text3); }
+
+  /* Evidence chain */
+  .evidence-chain { font-size: 11px; line-height: 1.8; }
+  .ev-item { display: flex; align-items: center; gap: 6px; padding: 4px 0; border-bottom: 1px solid var(--border); }
+  .ev-item:last-child { border-bottom: none; }
+  .ev-label { color: var(--text2); width: 140px; flex-shrink: 0; }
+  .ev-bar { flex: 1; height: 6px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
+  .ev-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+  .ev-positive .ev-fill { background: var(--green); }
+  .ev-negative .ev-fill { background: var(--red); }
+  .ev-delta { width: 60px; text-align: right; flex-shrink: 0; }
+  .ev-positive .ev-delta { color: var(--green); }
+  .ev-negative .ev-delta { color: var(--red); }
+
+  /* Bayesian chain display */
+  .bayes-chain { font-size: 11px; color: var(--text2); line-height: 2; padding: 8px 0; overflow-x: auto; white-space: nowrap; }
+  .bc-prior { color: var(--accent); font-weight: bold; }
+  .bc-ev-pos { color: var(--green); }
+  .bc-ev-neg { color: var(--red); }
+  .bc-final { color: #fff; font-weight: bold; }
+  .bc-market { color: var(--text2); }
+  .bc-edge-pos { color: var(--green); font-weight: bold; }
+  .bc-edge-neg { color: var(--red); font-weight: bold; }
+  .bc-signal { font-weight: bold; letter-spacing: 1px; }
+  .bc-buy-yes { color: var(--green); }
+  .bc-buy-no { color: var(--red); }
+  .bc-hold { color: var(--text3); }
+
+  /* Market monitor card */
+  .market-item { padding: 12px; border-bottom: 1px solid var(--border); }
+  .market-item:last-child { border-bottom: none; }
+  .market-q { font-size: 12px; margin-bottom: 6px; }
+  .market-meta { display: flex; gap: 12px; font-size: 11px; color: var(--text2); margin-bottom: 8px; }
+  .tag { background: var(--bg3); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; }
+
+  /* P&L Chart */
+  .chart-container { position: relative; height: 180px; }
+  canvas { width: 100% !important; }
+
+  /* Calibration */
+  .calibration-chart { position: relative; height: 200px; }
+  .weight-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
+  .weight-label { width: 140px; color: var(--text2); font-size: 11px; }
+  .weight-bar { flex: 1; height: 8px; background: var(--bg3); border-radius: 4px; overflow: hidden; }
+  .weight-fill { height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.5s; }
+  .weight-val { width: 50px; text-align: right; font-size: 11px; color: var(--text); }
+
+  /* Readiness */
+  .readiness-bar { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; height: 8px; margin: 6px 0 2px; }
+  .readiness-fill { height: 100%; border-radius: 8px; transition: width 0.5s; }
+  .readiness-metric { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .readiness-metric:last-child { border-bottom: none; }
+  .check-ok { color: var(--green); }
+  .check-fail { color: var(--red); }
+  .ready-banner { background: #0a2a1a; border: 1px solid var(--green); border-radius: 8px; padding: 12px; text-align: center; color: var(--green); font-weight: bold; letter-spacing: 1px; margin-bottom: 12px; display: none; }
+
+  /* Scrollable */
+  .scrollable { max-height: 350px; overflow-y: auto; }
+  .scrollable::-webkit-scrollbar { width: 4px; }
+  .scrollable::-webkit-scrollbar-track { background: var(--bg2); }
+  .scrollable::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* Responsive */
+  @media (max-width: 900px) { .main { grid-template-columns: 1fr; } .stats-grid { grid-template-columns: repeat(2, 1fr); } }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <h1>⬡ BAYESIAN MARKET BOT</h1>
+  <div id="modeBadge" class="mode-badge mode-paper">PAPER</div>
+  <div class="price-chip"><span>BTC </span><strong id="btcPrice">—</strong></div>
+  <div class="price-chip"><span>ETH </span><strong id="ethPrice">—</strong></div>
+  <div class="balance-chip"><span>Balance: </span><strong id="balance">$500.00</strong></div>
+  <div class="last-update" id="lastUpdate">Connecting...</div>
+</div>
+
+<!-- Main Grid -->
+<div class="main">
+
+  <!-- P&L Stats Row -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span class="card-title">Performance Overview</span>
+      <span id="scanCount" style="font-size:11px;color:var(--text3)">Scans: 0</span>
+    </div>
+    <div class="card-body">
+      <div class="stats-grid">
+        <div class="stat-box">
+          <div class="stat-label">Total P&L</div>
+          <div class="stat-value" id="totalPnl">$0.00</div>
+          <div class="stat-sub">all time</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Win Rate</div>
+          <div class="stat-value accent" id="winRate">—</div>
+          <div class="stat-sub" id="winRateSub">0 trades</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Sharpe Ratio</div>
+          <div class="stat-value" id="sharpe">—</div>
+          <div class="stat-sub">annualized</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Open Positions</div>
+          <div class="stat-value accent" id="openCount">0</div>
+          <div class="stat-sub">max 3</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- P&L Curve -->
+  <div class="card">
+    <div class="card-header"><span class="card-title">P&L Curve</span></div>
+    <div class="card-body">
+      <div class="chart-container">
+        <canvas id="pnlChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Readiness Meter -->
+  <div class="card">
+    <div class="card-header"><span class="card-title">Live Trading Readiness</span></div>
+    <div class="card-body">
+      <div id="readyBanner" class="ready-banner">✓ READY FOR LIVE TRADING</div>
+      <div class="readiness-metric">
+        <span>Trades completed</span>
+        <span id="tradesProgress">0 / 40</span>
+      </div>
+      <div class="readiness-bar"><div id="tradesBar" class="readiness-fill" style="width:0%;background:var(--accent)"></div></div>
+      <div class="readiness-metric">
+        <span>Win Rate</span>
+        <span id="winRateCheck" class="check-fail">0.0% <small>(need 55%)</small></span>
+      </div>
+      <div class="readiness-bar"><div id="winRateBar" class="readiness-fill" style="width:0%;background:var(--accent)"></div></div>
+      <div class="readiness-metric">
+        <span>Sharpe Ratio</span>
+        <span id="sharpeCheck" class="check-fail">0.00 <small>(need 1.0)</small></span>
+      </div>
+      <div class="readiness-bar"><div id="sharpeBar" class="readiness-fill" style="width:0%;background:var(--accent)"></div></div>
+    </div>
+  </div>
+
+  <!-- Open Positions -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span class="card-title">Open Positions</span>
+      <span style="font-size:11px;color:var(--text3)" id="posCount">0 positions</span>
+    </div>
+    <div class="card-body" style="padding:0">
+      <div id="positionsTable">
+        <div class="empty-state">No open positions</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Market Monitor (Bayesian Transparency) -->
+  <div class="card full-width">
+    <div class="card-header">
+      <span class="card-title">Bayesian Market Analysis</span>
+      <span style="font-size:11px;color:var(--text3)">Live evidence chains</span>
+    </div>
+    <div class="card-body" style="padding:0">
+      <div id="monitoredMarkets" class="scrollable">
+        <div class="empty-state">Scanning for markets...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Calibration Chart -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Calibration Reliability</span>
+      <span id="lastCalibration" style="font-size:11px;color:var(--text3)">Never calibrated</span>
+    </div>
+    <div class="card-body">
+      <div class="calibration-chart">
+        <canvas id="calibChart"></canvas>
+      </div>
+      <div style="font-size:10px;color:var(--text3);margin-top:8px;text-align:center">
+        Perfect calibration = diagonal. Points above = underconfident. Points below = overconfident.
+      </div>
+    </div>
+  </div>
+
+  <!-- Evidence Weights -->
+  <div class="card">
+    <div class="card-header"><span class="card-title">Evidence Weights & Accuracy</span></div>
+    <div class="card-body" id="evidenceWeights">
+      <div style="color:var(--text3);text-align:center;padding:20px">Loading...</div>
+    </div>
+  </div>
+
+  <!-- Recent Trades -->
+  <div class="card full-width">
+    <div class="card-header"><span class="card-title">Recent Trades</span></div>
+    <div class="card-body" style="padding:0">
+      <div id="recentTradesTable" class="scrollable">
+        <div class="empty-state">No closed trades yet</div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<script>
+// ── Mini chart library (no deps) ─────────────────────────────────────────
+function drawLineChart(canvasId, labels, data, color) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.offsetWidth || 400;
+  const H = canvas.offsetHeight || 180;
+  canvas.width = W;
+  canvas.height = H;
+  ctx.clearRect(0, 0, W, H);
+
+  if (!data || data.length < 2) {
+    ctx.fillStyle = '#606075';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('No data yet', W/2, H/2);
+    return;
+  }
+
+  const pad = { top: 20, right: 20, bottom: 30, left: 50 };
+  const w = W - pad.left - pad.right;
+  const h = H - pad.top - pad.bottom;
+  const min = Math.min(...data);
+  const max = Math.max(...data);
+  const range = max - min || 1;
+
+  // Grid
+  ctx.strokeStyle = '#2a2a35';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.top + (h * i / 4);
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + w, y); ctx.stroke();
+    const val = max - (range * i / 4);
+    ctx.fillStyle = '#606075';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText('$' + val.toFixed(2), pad.left - 4, y + 3);
+  }
+
+  // Zero line
+  if (min < 0 && max > 0) {
+    const zeroY = pad.top + h * (1 - (0 - min) / range);
+    ctx.strokeStyle = '#404050';
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(pad.left, zeroY); ctx.lineTo(pad.left + w, zeroY); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Area fill
+  const gradient = ctx.createLinearGradient(0, pad.top, 0, pad.top + h);
+  gradient.addColorStop(0, color + '40');
+  gradient.addColorStop(1, color + '05');
+  ctx.beginPath();
+  data.forEach((d, i) => {
+    const x = pad.left + (i / (data.length - 1)) * w;
+    const y = pad.top + h * (1 - (d - min) / range);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.lineTo(pad.left + w, pad.top + h);
+  ctx.lineTo(pad.left, pad.top + h);
+  ctx.closePath();
+  ctx.fillStyle = gradient;
+  ctx.fill();
+
+  // Line
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  data.forEach((d, i) => {
+    const x = pad.left + (i / (data.length - 1)) * w;
+    const y = pad.top + h * (1 - (d - min) / range);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+function drawCalibrationChart(canvasId, buckets) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.offsetWidth || 300;
+  const H = canvas.offsetHeight || 200;
+  canvas.width = W;
+  canvas.height = H;
+  ctx.clearRect(0, 0, W, H);
+
+  const pad = { top: 20, right: 20, bottom: 40, left: 40 };
+  const w = W - pad.left - pad.right;
+  const h = H - pad.top - pad.bottom;
+
+  // Grid
+  ctx.strokeStyle = '#2a2a35';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 5; i++) {
+    const x = pad.left + w * i / 5;
+    const y = pad.top + h * i / 5;
+    ctx.beginPath(); ctx.moveTo(x, pad.top); ctx.lineTo(x, pad.top + h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + w, y); ctx.stroke();
+    ctx.fillStyle = '#606075';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText((i/5).toFixed(1), pad.left + w * i / 5, pad.top + h + 12);
+    if (i > 0) {
+      ctx.textAlign = 'right';
+      ctx.fillText((1 - i/5).toFixed(1), pad.left - 4, pad.top + h * i / 5 + 3);
+    }
+  }
+
+  // Perfect calibration diagonal
+  ctx.strokeStyle = '#6c63ff40';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(pad.left, pad.top + h);
+  ctx.lineTo(pad.left + w, pad.top);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Labels
+  ctx.fillStyle = '#606075';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('Predicted Probability', pad.left + w/2, H - 5);
+
+  if (!buckets || buckets.length === 0) {
+    ctx.fillStyle = '#606075';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('No calibration data', W/2, H/2);
+    return;
+  }
+
+  // Data points
+  buckets.forEach(b => {
+    const x = pad.left + b.predicted * w;
+    const y = pad.top + h * (1 - b.actual);
+    const r = Math.min(8, 3 + b.count);
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#00d4aa';
+    ctx.fill();
+    ctx.strokeStyle = '#0d0d0f';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  });
+}
+
+// ── Data fetching ─────────────────────────────────────────────────────────
+async function fetchJSON(url) {
+  try {
+    const r = await fetch(url);
+    return await r.json();
+  } catch { return null; }
+}
+
+function fmt(n, decimals=2) {
+  if (n === undefined || n === null) return '—';
+  return Number(n).toFixed(decimals);
+}
+
+function pnlColor(v) {
+  return v > 0 ? 'green' : v < 0 ? 'red' : '';
+}
+
+// ── Render functions ──────────────────────────────────────────────────────
+async function updateStatus() {
+  const d = await fetchJSON('/api/status');
+  if (!d) return;
+
+  document.getElementById('lastUpdate').textContent =
+    'Updated ' + new Date().toLocaleTimeString();
+
+  const badge = document.getElementById('modeBadge');
+  badge.textContent = d.mode ? d.mode.toUpperCase() : 'PAPER';
+  badge.className = 'mode-badge ' + (d.mode === 'live' ? 'mode-live' : 'mode-paper');
+
+  const btc = d.btc_price;
+  const eth = d.eth_price;
+  document.getElementById('btcPrice').textContent = btc ? '$' + btc.toLocaleString('en', {maximumFractionDigits: 0}) : '—';
+  document.getElementById('ethPrice').textContent = eth ? '$' + eth.toLocaleString('en', {maximumFractionDigits: 0}) : '—';
+
+  const bal = d.mode === 'live' ? d.live_balance : d.paper_balance;
+  document.getElementById('balance').textContent = '$' + (bal||500).toFixed(2);
+  document.getElementById('scanCount').textContent = 'Scans: ' + (d.scan_count || 0);
+}
+
+async function updatePerformance() {
+  const d = await fetchJSON('/api/performance');
+  if (!d) return;
+
+  const at = d.all_time || {};
+  const r = d.readiness || {};
+
+  const pnl = at.total_pnl || 0;
+  const el = document.getElementById('totalPnl');
+  el.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+  el.className = 'stat-value ' + pnlColor(pnl);
+
+  const wr = (at.win_rate || 0) * 100;
+  const wrEl = document.getElementById('winRate');
+  wrEl.textContent = wr.toFixed(1) + '%';
+  wrEl.className = 'stat-value ' + (wr >= 55 ? 'green' : wr >= 45 ? 'yellow' : 'red');
+  document.getElementById('winRateSub').textContent = (at.trades || 0) + ' trades';
+
+  const sh = at.sharpe || 0;
+  const shEl = document.getElementById('sharpe');
+  shEl.textContent = sh.toFixed(2);
+  shEl.className = 'stat-value ' + (sh >= 1.0 ? 'green' : sh >= 0 ? 'yellow' : 'red');
+
+  // Readiness
+  const trades = r.trades_done || 0;
+  const tPct = r.trades_pct || 0;
+  document.getElementById('tradesProgress').textContent = trades + ' / 40';
+  document.getElementById('tradesBar').style.width = tPct + '%';
+  document.getElementById('tradesBar').style.background = tPct >= 100 ? 'var(--green)' : 'var(--accent)';
+
+  document.getElementById('winRateCheck').innerHTML =
+    wr.toFixed(1) + '% <small>(need 55%)</small>';
+  document.getElementById('winRateCheck').className = wr >= 55 ? 'check-ok' : 'check-fail';
+  document.getElementById('winRateBar').style.width = Math.min(100, wr/55*100) + '%';
+  document.getElementById('winRateBar').style.background = wr >= 55 ? 'var(--green)' : 'var(--accent)';
+
+  document.getElementById('sharpeCheck').innerHTML =
+    sh.toFixed(2) + ' <small>(need 1.0)</small>';
+  document.getElementById('sharpeCheck').className = sh >= 1.0 ? 'check-ok' : 'check-fail';
+  document.getElementById('sharpeBar').style.width = Math.min(100, sh/1.0*100) + '%';
+  document.getElementById('sharpeBar').style.background = sh >= 1.0 ? 'var(--green)' : 'var(--accent)';
+
+  if (r.ready) {
+    document.getElementById('readyBanner').style.display = 'block';
+  }
+}
+
+async function updatePositions() {
+  const positions = await fetchJSON('/api/positions');
+  const count = positions ? positions.length : 0;
+  document.getElementById('openCount').textContent = count;
+  document.getElementById('posCount').textContent = count + ' position' + (count !== 1 ? 's' : '');
+
+  const container = document.getElementById('positionsTable');
+  if (!positions || positions.length === 0) {
+    container.innerHTML = '<div class="empty-state">No open positions</div>';
+    return;
+  }
+
+  let html = `<table>
+    <tr>
+      <th>Asset</th><th>Outcome</th><th>Question</th>
+      <th>Posterior</th><th>Market</th><th>Edge</th>
+      <th>Entry</th><th>Current</th><th>Size</th>
+      <th>Unrealized P&L</th><th>Expires</th><th>Regime</th>
+    </tr>`;
+
+  positions.forEach(p => {
+    const pnlClass = p.unrealized_pnl >= 0 ? 'green' : 'red';
+    const edgeClass = p.divergence > 0 ? 'green' : 'red';
+    html += `<tr>
+      <td><strong>${p.asset}</strong></td>
+      <td>${p.outcome}</td>
+      <td style="max-width:200px;font-size:11px">${p.question}</td>
+      <td class="accent">${(p.posterior*100).toFixed(1)}%</td>
+      <td>${(p.market_price*100).toFixed(1)}%</td>
+      <td class="${edgeClass}">${p.divergence > 0 ? '+' : ''}${(p.divergence*100).toFixed(1)}%</td>
+      <td>${p.entry_price.toFixed(3)}</td>
+      <td>${p.current_price.toFixed(3)}</td>
+      <td>$${p.size_usd.toFixed(2)}</td>
+      <td class="${pnlClass}">$${p.unrealized_pnl.toFixed(2)} (${p.unrealized_pct > 0 ? '+' : ''}${p.unrealized_pct.toFixed(1)}%)</td>
+      <td>${p.minutes_to_expiry.toFixed(1)}m</td>
+      <td style="color:var(--text3)">${p.regime}</td>
+    </tr>`;
+  });
+  html += '</table>';
+  container.innerHTML = html;
+}
+
+async function updateMonitoredMarkets() {
+  const markets = await fetchJSON('/api/monitored_markets');
+  const container = document.getElementById('monitoredMarkets');
+  if (!markets || markets.length === 0) {
+    container.innerHTML = '<div class="empty-state">No markets being analyzed</div>';
+    return;
+  }
+
+  let html = '';
+  markets.forEach(m => {
+    const signalClass = m.signal === 'BUY_YES' ? 'bc-buy-yes' : m.signal === 'BUY_NO' ? 'bc-buy-no' : 'bc-hold';
+    const edgeClass = m.divergence > 0 ? 'green' : m.divergence < 0 ? 'red' : '';
+    const edgeSign = m.divergence > 0 ? '+' : '';
+
+    // Build evidence chain
+    let chainHtml = `<span class="bc-prior">Prior=${(m.prior*100).toFixed(0)}%</span>`;
+    if (m.evidence_updates) {
+      m.evidence_updates.forEach(ev => {
+        const cls = ev.delta >= 0 ? 'bc-ev-pos' : 'bc-ev-neg';
+        const sign = ev.delta >= 0 ? '+' : '';
+        chainHtml += ` → <span class="${cls}">${ev.layer}${sign}${(ev.delta*100).toFixed(0)}%</span>`;
+      });
+    }
+    chainHtml += ` → <span class="bc-final">Final=${(m.posterior*100).toFixed(0)}%</span>`;
+    chainHtml += ` vs <span class="bc-market">Market=${(m.market_price*100).toFixed(0)}%</span>`;
+    chainHtml += ` → <span class="${edgeClass} bc-edge-pos">EDGE: ${edgeSign}${(m.divergence*100).toFixed(0)}%</span>`;
+    chainHtml += ` → <span class="${signalClass} bc-signal">${m.signal}</span>`;
+
+    html += `<div class="market-item">
+      <div class="market-q">${m.question}</div>
+      <div class="market-meta">
+        <span class="tag">${m.asset}</span>
+        <span class="tag">${m.timeframe}</span>
+        <span class="tag">vol $${(m.volume||0).toFixed(0)}</span>
+        <span class="tag">${m.regime || '—'}</span>
+        <span class="tag">${m.session || '—'}</span>
+        <span class="tag">${m.minutes_left ? m.minutes_left.toFixed(1) + 'm left' : '—'}</span>
+      </div>
+      <div class="bayes-chain">${chainHtml}</div>
+    </div>`;
+  });
+  container.innerHTML = html;
+}
+
+async function updatePnlChart() {
+  const curve = await fetchJSON('/api/pnl_curve');
+  if (!curve) return;
+  const values = curve.map(p => p.pnl);
+  const color = (values[values.length-1] || 0) >= 0 ? '#00c97a' : '#ff4757';
+  drawLineChart('pnlChart', [], values, color);
+}
+
+async function updateCalibration() {
+  const d = await fetchJSON('/api/calibration');
+  if (!d) return;
+
+  if (d.last_calibration) {
+    const dt = new Date(d.last_calibration);
+    document.getElementById('lastCalibration').textContent =
+      'Last: ' + dt.toLocaleDateString();
+  }
+
+  drawCalibrationChart('calibChart', d.calibration_buckets || []);
+
+  // Evidence weights
+  const weights = d.current_weights || {};
+  const corrs = d.layer_correlations || {};
+  const container = document.getElementById('evidenceWeights');
+  const layers = [
+    ['order_flow', 'Order Flow'],
+    ['price_momentum', 'Price Momentum'],
+    ['social_buzz', 'Social Buzz'],
+    ['on_chain', 'On-Chain'],
+    ['market_sentiment', 'Mkt Sentiment'],
+  ];
+
+  const maxW = Math.max(...Object.values(weights), 2.0);
+  let html = '';
+  layers.forEach(([key, label]) => {
+    const w = weights[key] || 1.0;
+    const corr = corrs[key];
+    const corrStr = corr !== undefined ? (corr * 100).toFixed(0) + '% corr' : '';
+    const corrColor = corr >= 0.6 ? 'var(--green)' : corr >= 0.4 ? 'var(--yellow)' : 'var(--red)';
+    html += `<div class="weight-row">
+      <div class="weight-label">${label}</div>
+      <div class="weight-bar"><div class="weight-fill" style="width:${Math.min(100,(w/maxW)*100)}%"></div></div>
+      <div class="weight-val">${w.toFixed(2)}</div>
+      ${corrStr ? `<div style="width:60px;font-size:10px;color:${corrColor}">${corrStr}</div>` : ''}
+    </div>`;
+  });
+  container.innerHTML = html;
+}
+
+async function updateRecentTrades() {
+  const trades = await fetchJSON('/api/recent_trades');
+  const container = document.getElementById('recentTradesTable');
+  if (!trades || trades.length === 0) {
+    container.innerHTML = '<div class="empty-state">No closed trades yet</div>';
+    return;
+  }
+
+  let html = `<table>
+    <tr>
+      <th>ID</th><th>Asset</th><th>Outcome</th>
+      <th>Posterior</th><th>Market</th><th>Edge</th>
+      <th>Regime</th><th>P&L</th><th>%</th><th>Exit Reason</th>
+    </tr>`;
+  trades.filter(t => t.status === 'closed').slice(0, 15).forEach(t => {
+    const pnlClass = (t.pnl_usd || 0) >= 0 ? 'green' : 'red';
+    const pnlSign = (t.pnl_usd || 0) >= 0 ? '+' : '';
+    const div = t.divergence_at_entry || 0;
+    html += `<tr>
+      <td style="color:var(--text3)">${(t.trade_id||'').slice(0,6)}</td>
+      <td><strong>${t.asset||'—'}</strong></td>
+      <td>${t.outcome||'—'}</td>
+      <td class="accent">${((t.posterior_at_entry||0.5)*100).toFixed(0)}%</td>
+      <td>${((t.market_price_at_entry||0.5)*100).toFixed(0)}%</td>
+      <td class="${div>0?'green':'red'}">${div>0?'+':''}${(div*100).toFixed(0)}%</td>
+      <td style="color:var(--text3)">${t.regime_at_entry||'—'}</td>
+      <td class="${pnlClass}">${pnlSign}$${(t.pnl_usd||0).toFixed(2)}</td>
+      <td class="${pnlClass}">${pnlSign}${((t.pnl_pct||0)*100).toFixed(1)}%</td>
+      <td style="color:var(--text3);font-size:10px">${(t.exit_reason||'—').slice(0,20)}</td>
+    </tr>`;
+  });
+  html += '</table>';
+  container.innerHTML = html;
+}
+
+// ── Polling loops ─────────────────────────────────────────────────────────
+async function refreshAll() {
+  await Promise.all([
+    updateStatus(),
+    updatePositions(),
+    updateMonitoredMarkets(),
+    updatePerformance(),
+    updatePnlChart(),
+    updateCalibration(),
+    updateRecentTrades(),
+  ]);
+}
+
+refreshAll();
+setInterval(updateStatus, 10000);
+setInterval(updatePositions, 10000);
+setInterval(updateMonitoredMarkets, 15000);
+setInterval(updatePerformance, 30000);
+setInterval(updatePnlChart, 30000);
+setInterval(updateCalibration, 60000);
+setInterval(updateRecentTrades, 30000);
+
+// Resize handler for charts
+window.addEventListener('resize', () => {
+  updatePnlChart();
+  updateCalibration();
+});
+</script>
+</body>
+</html>

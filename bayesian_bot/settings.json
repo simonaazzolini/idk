@@ -1,0 +1,29 @@
+{
+  "mode": "paper",
+  "polymarket_private_key": "",
+  "polymarket_api_key": "",
+  "polymarket_api_secret": "",
+  "polymarket_api_passphrase": "",
+  "anthropic_api_key": "",
+  "newsapi_key": "",
+  "paper_starting_balance": 500,
+  "live_starting_balance": 0,
+  "risk_per_trade_pct": 0.01,
+  "max_trade_size_usd": 10,
+  "min_trade_size_usd": 1,
+  "min_divergence_threshold": 0.08,
+  "max_open_positions": 3,
+  "min_market_volume": 200,
+  "max_market_window_minutes": 30,
+  "min_market_window_minutes": 1,
+  "stop_loss_pct": 0.40,
+  "early_exit_minutes": 2,
+  "max_slippage_pct": 0.02,
+  "evidence_weights": {
+    "order_flow": 1.0,
+    "price_momentum": 0.8,
+    "social_buzz": 0.5,
+    "on_chain": 0.4,
+    "market_sentiment": 0.3
+  }
+}
