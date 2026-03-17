@@ -48,10 +48,11 @@ class MarketInfo:
 
     def is_valid(self, config) -> bool:
         """Check if market passes all filters."""
-        if self.minutes_to_resolution < config.min_market_window_minutes:
+        # Must have meaningful time remaining (at least 5 minutes)
+        if self.minutes_to_resolution < max(5, config.min_market_window_minutes):
             logger.debug(
-                "FILTER: %s too soon (%.1fmin < %dmin min)",
-                self.question[:40], self.minutes_to_resolution, config.min_market_window_minutes
+                "FILTER: %s too soon/expired (%.1fmin remaining)",
+                self.question[:40], self.minutes_to_resolution
             )
             return False
         if self.minutes_to_resolution > config.max_market_window_minutes:
@@ -206,6 +207,7 @@ class MarketScanner:
                 params={
                     "active": "true",
                     "closed": "false",
+                    "archived": "false",
                     "limit": limit,
                     "order": "volume24hr",
                     "ascending": "false"
@@ -275,6 +277,12 @@ class MarketScanner:
         """Parse raw market data into MarketInfo."""
         question = raw.get("question", raw.get("title", ""))
         if not question:
+            return None
+
+        # Skip resolved, closed, or pending-resolution markets
+        if raw.get("resolved") or raw.get("resolutionOutcome") or raw.get("payouts"):
+            return None
+        if raw.get("closed") or not raw.get("active", True):
             return None
 
         asset = self._is_crypto_market(question)
