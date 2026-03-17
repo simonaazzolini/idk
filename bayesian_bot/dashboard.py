@@ -218,15 +218,30 @@ def health():
 
 
 def run_dashboard(host: str = "0.0.0.0", port: int = 8082, debug: bool = False) -> threading.Thread:
-    """Start the Flask dashboard in a background thread using make_server."""
-    from werkzeug.serving import make_server
+    """Start the Flask dashboard in a background thread."""
+    import os
 
-    server = make_server(host, port, app)
-    server.timeout = 1
+    # Try make_server first — proper WSGI server for threading
+    _server = None
+    try:
+        from werkzeug.serving import make_server
+        _server = make_server(host, port, app)
+        _server.timeout = 1
+    except Exception as e:
+        logger.warning("make_server() failed (%s) — falling back to app.run()", e)
+        _server = None
 
-    def _run():
-        logger.info("Dashboard listening on http://%s:%d", host, port)
-        server.serve_forever()
+    if _server is not None:
+        def _run():
+            logger.info("Dashboard listening on http://localhost:%d", port)
+            _server.serve_forever()
+    else:
+        def _run():
+            os.environ.pop("WERKZEUG_RUN_MAIN", None)
+            os.environ.pop("WERKZEUG_SERVER_FD", None)
+            logger.info("Dashboard (fallback) listening on http://localhost:%d", port)
+            app.run(host=host, port=port, debug=False,
+                    use_reloader=False, threaded=True, passthrough_errors=False)
 
     thread = threading.Thread(target=_run, daemon=True, name="dashboard")
     thread.start()

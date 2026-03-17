@@ -154,11 +154,11 @@ class EvidenceCollector:
             # Each candle: [open_time, open, high, low, close, ...]
             return [float(c[4]) for c in candles]
         except Exception as e:
-            logger.debug("Binance price fetch for %s: %s", asset, e)
+            logger.warning("Binance price fetch for %s failed: %s", asset, e)
             return []
 
     def _fetch_prices_coingecko(self, asset: str) -> List[float]:
-        """Fetch price history from CoinGecko free API."""
+        """Fetch price history from CoinGecko free API (hourly granularity for 1 day)."""
         asset_id = "bitcoin" if asset.upper() == "BTC" else "ethereum"
         try:
             resp = self.session.get(
@@ -171,29 +171,56 @@ class EvidenceCollector:
             prices_raw = data.get("prices", [])
             return [p[1] for p in prices_raw]
         except Exception as e:
-            logger.debug("CoinGecko price fetch for %s: %s", asset, e)
+            logger.warning("CoinGecko market_chart for %s failed: %s", asset, e)
             return []
+
+    def _fetch_prices_simple(self, asset: str) -> List[float]:
+        """
+        Last-resort: fetch only current price from CoinGecko simple endpoint.
+        Returns a flat list of 60 identical prices — momentum will be 0 but
+        price will be correct for display and regime detection.
+        """
+        coin_id = "bitcoin" if asset.upper() == "BTC" else "ethereum"
+        try:
+            resp = self.session.get(
+                f"{COINGECKO_URL}/simple/price",
+                params={"ids": coin_id, "vs_currencies": "usd"},
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            price = float(data.get(coin_id, {}).get("usd", 0.0))
+            if price > 0:
+                return [price] * 60
+        except Exception as e:
+            logger.warning("CoinGecko simple price for %s failed: %s", asset, e)
+        return []
 
     def collect_price_momentum(self, asset: str) -> Tuple[dict, List[float]]:
         """
         Fetch price history and compute momentum signals.
-        Primary: Binance 1-minute candles. Fallback: CoinGecko.
+        Sources tried in order: Binance → CoinGecko chart → CoinGecko simple price.
         Returns (momentum_dict, price_history_list)
         """
         cached = self._cache_get(f"momentum_{asset}")
         if cached:
             return cached
 
-        # Try Binance first (more reliable, no rate limits for public data)
+        # Source 1: Binance 1-minute candles (best, no key required)
         prices = self._fetch_prices_binance(asset)
 
-        # Fall back to CoinGecko
+        # Source 2: CoinGecko hourly chart
         if not prices:
-            logger.debug("Binance unavailable for %s, trying CoinGecko", asset)
+            logger.info("Binance unavailable for %s, trying CoinGecko chart", asset)
             prices = self._fetch_prices_coingecko(asset)
 
+        # Source 3: CoinGecko simple price (current price only, no momentum)
         if not prices:
-            logger.warning("All price sources failed for %s", asset)
+            logger.info("CoinGecko chart unavailable for %s, trying simple price", asset)
+            prices = self._fetch_prices_simple(asset)
+
+        if not prices:
+            logger.error("ALL price sources failed for %s — BTC/ETH price will be $0", asset)
             return self._empty_momentum(), []
 
         # Update rolling history
