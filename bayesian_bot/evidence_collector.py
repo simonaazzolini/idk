@@ -137,10 +137,10 @@ class EvidenceCollector:
 
     # ── Evidence 2: Price Momentum ─────────────────────────────────────────
 
-    def _fetch_prices_binance(self, asset: str) -> List[float]:
+    def _fetch_prices_binance(self, asset: str) -> Tuple[List[float], List[int]]:
         """
         Fetch recent 1-minute candles from Binance public API.
-        No API key required. Returns list of close prices (newest last).
+        Returns (prices, timestamps_ms) newest last.
         """
         symbol = "BTCUSDT" if asset.upper() == "BTC" else "ETHUSDT"
         try:
@@ -151,14 +151,18 @@ class EvidenceCollector:
             )
             resp.raise_for_status()
             candles = resp.json()
-            # Each candle: [open_time, open, high, low, close, ...]
-            return [float(c[4]) for c in candles]
+            prices = [float(c[4]) for c in candles]
+            timestamps = [int(c[0]) for c in candles]  # open time ms
+            return prices, timestamps
         except Exception as e:
             logger.warning("Binance price fetch for %s failed: %s", asset, e)
-            return []
+            return [], []
 
-    def _fetch_prices_coingecko(self, asset: str) -> List[float]:
-        """Fetch price history from CoinGecko free API (hourly granularity for 1 day)."""
+    def _fetch_prices_coingecko(self, asset: str) -> Tuple[List[float], List[int]]:
+        """
+        Fetch price history from CoinGecko free API.
+        Returns (prices, timestamps_ms) — granularity varies (5min to hourly).
+        """
         asset_id = "bitcoin" if asset.upper() == "BTC" else "ethereum"
         try:
             resp = self.session.get(
@@ -169,16 +173,17 @@ class EvidenceCollector:
             resp.raise_for_status()
             data = resp.json()
             prices_raw = data.get("prices", [])
-            return [p[1] for p in prices_raw]
+            prices = [p[1] for p in prices_raw]
+            timestamps = [int(p[0]) for p in prices_raw]
+            return prices, timestamps
         except Exception as e:
             logger.warning("CoinGecko market_chart for %s failed: %s", asset, e)
-            return []
+            return [], []
 
-    def _fetch_prices_simple(self, asset: str) -> List[float]:
+    def _fetch_prices_simple(self, asset: str) -> Tuple[List[float], List[int]]:
         """
         Last-resort: fetch only current price from CoinGecko simple endpoint.
-        Returns a flat list of 60 identical prices — momentum will be 0 but
-        price will be correct for display and regime detection.
+        Returns flat list (no timestamps) — no momentum signal but price is correct.
         """
         coin_id = "bitcoin" if asset.upper() == "BTC" else "ethereum"
         try:
@@ -191,15 +196,16 @@ class EvidenceCollector:
             data = resp.json()
             price = float(data.get(coin_id, {}).get("usd", 0.0))
             if price > 0:
-                return [price] * 60
+                return [price] * 60, []
         except Exception as e:
             logger.warning("CoinGecko simple price for %s failed: %s", asset, e)
-        return []
+        return [], []
 
     def collect_price_momentum(self, asset: str) -> Tuple[dict, List[float]]:
         """
         Fetch price history and compute momentum signals.
         Sources tried in order: Binance → CoinGecko chart → CoinGecko simple price.
+        Uses timestamps for time-accurate returns regardless of data granularity.
         Returns (momentum_dict, price_history_list)
         """
         cached = self._cache_get(f"momentum_{asset}")
@@ -207,17 +213,17 @@ class EvidenceCollector:
             return cached
 
         # Source 1: Binance 1-minute candles (best, no key required)
-        prices = self._fetch_prices_binance(asset)
+        prices, timestamps = self._fetch_prices_binance(asset)
 
-        # Source 2: CoinGecko hourly chart
+        # Source 2: CoinGecko chart (5min or hourly depending on free tier)
         if not prices:
             logger.info("Binance unavailable for %s, trying CoinGecko chart", asset)
-            prices = self._fetch_prices_coingecko(asset)
+            prices, timestamps = self._fetch_prices_coingecko(asset)
 
         # Source 3: CoinGecko simple price (current price only, no momentum)
         if not prices:
             logger.info("CoinGecko chart unavailable for %s, trying simple price", asset)
-            prices = self._fetch_prices_simple(asset)
+            prices, timestamps = self._fetch_prices_simple(asset)
 
         if not prices:
             logger.error("ALL price sources failed for %s — BTC/ETH price will be $0", asset)
@@ -230,9 +236,17 @@ class EvidenceCollector:
             self._price_history_eth = prices
 
         now_price = prices[-1]
+        now_ms = timestamps[-1] if timestamps else int(time.time() * 1000)
 
         def get_return(minutes_back: int) -> float:
-            idx = max(0, len(prices) - minutes_back - 1)
+            """Time-accurate return: find price closest to minutes_back ago."""
+            if timestamps:
+                target_ms = now_ms - minutes_back * 60 * 1000
+                # Find index of closest timestamp to target
+                idx = min(range(len(timestamps)),
+                          key=lambda i: abs(timestamps[i] - target_ms))
+            else:
+                idx = max(0, len(prices) - minutes_back - 1)
             old = prices[idx]
             if old == 0:
                 return 0.0
