@@ -382,8 +382,11 @@ class BayesianEngine:
         vol_ratio = sb.get("volume_ratio", 1.0)
         sentiment = sb.get("sentiment_score", 0.0)
 
-        if vol_ratio > 2.0:
+        # High volume + any sentiment, or strong sentiment on its own
+        if vol_ratio > 1.5 and abs(sentiment) > 0.1:
             delta = 0.06 * (1 if sentiment > 0 else -1)
+        elif abs(sentiment) > 0.25:   # strong directional signal even without vol spike
+            delta = 0.03 * (1 if sentiment > 0 else -1)
         else:
             delta = 0.0
 
@@ -405,9 +408,13 @@ class BayesianEngine:
         vol_spike = oc.get("volume_ratio", 1.0)
 
         on_chain_delta = 0.0
-        if mempool > 50000:
+        # Normalize mempool against typical baseline (~15K tx) rather than hard 50K threshold
+        mempool_pressure = mempool / 15000.0 if mempool > 0 else 0.0
+        if mempool_pressure > 3.0:       # very congested: 3× baseline
             on_chain_delta += 0.04
-        if vol_spike > 2.0:
+        elif mempool_pressure > 1.5:     # above average: 1.5× baseline
+            on_chain_delta += 0.02
+        if vol_spike > 1.5:              # volume 1.5× average (was 2.0)
             on_chain_delta += 0.05
 
         if direction == "down":

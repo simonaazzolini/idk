@@ -8,6 +8,7 @@ Targets:
   - Not already in positions
 """
 import logging
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -94,6 +95,7 @@ class MarketScanner:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "BayesianBot/1.0"})
         self._last_scan: List[MarketInfo] = []
+        self._all_crypto_markets: List[MarketInfo] = []  # all parsed (pre-filter), for related-market lookups
         self._open_positions: set = set()  # condition_ids
 
     def set_open_positions(self, condition_ids: set) -> None:
@@ -188,7 +190,13 @@ class MarketScanner:
     def _get_token_ids(self, market: dict) -> tuple:
         """Get YES and NO token IDs."""
         clob_ids = market.get("clobTokenIds", [])
-        if len(clob_ids) >= 2:
+        # Gamma API often returns clobTokenIds as a JSON-encoded string — parse it
+        if isinstance(clob_ids, str):
+            try:
+                clob_ids = json.loads(clob_ids)
+            except (json.JSONDecodeError, ValueError):
+                clob_ids = []
+        if isinstance(clob_ids, list) and len(clob_ids) >= 2:
             return str(clob_ids[0]), str(clob_ids[1])
 
         # Alternative fields
@@ -361,11 +369,14 @@ class MarketScanner:
 
         candidates: List[MarketInfo] = []
         rejected_crypto = []
+        all_parsed: List[MarketInfo] = []  # all valid parses, pre-filter, for related-market lookup
 
         for raw in raw_markets:
             market = self.parse_market(raw)
             if market is None:
                 continue
+
+            all_parsed.append(market)
 
             # Skip if already in position
             if market.condition_id in self._open_positions:
@@ -380,6 +391,8 @@ class MarketScanner:
                 continue
 
             candidates.append(market)
+
+        self._all_crypto_markets = all_parsed
 
         if rejected_crypto:
             logger.debug(
@@ -424,9 +437,13 @@ class MarketScanner:
             return None
 
     def get_related_markets(self, asset: str, exclude_condition_id: str) -> List[MarketInfo]:
-        """Get related markets for confluence signal."""
-        related = []
-        for m in self._last_scan:
-            if m.asset == asset and m.condition_id != exclude_condition_id:
-                related.append(m)
+        """Get related markets for confluence signal.
+        Uses all parsed crypto markets (not just top_n) so related-market
+        lookups work even when only one market per asset passes the main filter.
+        """
+        source = self._all_crypto_markets if self._all_crypto_markets else self._last_scan
+        related = [m for m in source
+                   if m.asset == asset and m.condition_id != exclude_condition_id]
+        logger.info("RelatedMarkets %s: found %d related (from pool of %d)",
+                    asset, len(related), len(source))
         return related

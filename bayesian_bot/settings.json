@@ -11,7 +11,7 @@
   "risk_per_trade_pct": 0.01,
   "max_trade_size_usd": 10,
   "min_trade_size_usd": 1,
-  "min_divergence_threshold": 0.08,
+  "min_divergence_threshold": 0.04,
   "max_open_positions": 3,
   "min_market_volume": 200,
   "max_market_window_minutes": 30,

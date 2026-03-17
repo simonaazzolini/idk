@@ -90,6 +90,10 @@ class EvidenceCollector:
 
             bids = book.get("bids", [])
             asks = book.get("asks", [])
+            logger.info(
+                "OrderFlow raw book token=%s... status=%d bids=%d asks=%d",
+                token_id[:12], resp.status_code, len(bids), len(asks)
+            )
 
             # Calculate buy/sell volume at top 5 levels
             buy_vol = sum(
@@ -312,64 +316,123 @@ class EvidenceCollector:
 
     def collect_social_buzz(self, asset: str, newsapi_key: str) -> dict:
         """
-        Fetch recent news about the asset using NewsAPI.
+        Fetch social/news buzz about the asset.
+        Primary: NewsAPI with 4-hour window.
+        Fallback: CoinGecko market data (price change + volume change as proxy).
         Returns volume_ratio and sentiment_score.
         """
-        if not newsapi_key:
-            return {"volume_ratio": 1.0, "sentiment_score": 0.0, "error": "no API key"}
-
         cached = self._cache_get(f"buzz_{asset}")
         if cached:
             return cached
 
-        query = "bitcoin" if asset.upper() == "BTC" else "ethereum"
+        result = None
+
+        # ── Primary: NewsAPI ────────────────────────────────────────────────
+        if newsapi_key:
+            query = "bitcoin" if asset.upper() == "BTC" else "ethereum"
+            try:
+                resp = self.session.get(
+                    f"{NEWSAPI_URL}/everything",
+                    params={
+                        "q": query,
+                        "language": "en",
+                        "sortBy": "publishedAt",
+                        "pageSize": 20,
+                        "from": self._hours_ago_iso(4),   # 4h window (was 30min)
+                    },
+                    headers={"X-Api-Key": newsapi_key},
+                    timeout=10
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                logger.info(
+                    "SocialBuzz NewsAPI %s: status=%s total=%s articles_returned=%d",
+                    asset, data.get("status"), data.get("totalResults"), len(data.get("articles", []))
+                )
+
+                articles = data.get("articles", [])
+                count = len(articles)
+                volume_ratio = count / max(self._avg_news_count, 1)
+                self._avg_news_count = 0.9 * self._avg_news_count + 0.1 * max(count, 1)
+                sentiment = self._score_sentiment(articles, asset)
+
+                result = {
+                    "volume_ratio": volume_ratio,
+                    "sentiment_score": sentiment,
+                    "article_count": count,
+                    "avg_baseline": self._avg_news_count,
+                    "source": "newsapi",
+                }
+                logger.info(
+                    "SocialBuzz NewsAPI %s: articles=%d vol_ratio=%.2f sentiment=%.3f",
+                    asset, count, volume_ratio, sentiment
+                )
+            except Exception as e:
+                logger.info("SocialBuzz NewsAPI failed for %s: %s — trying CoinGecko fallback", asset, e)
+
+        # ── Fallback: CoinGecko market data ─────────────────────────────────
+        if result is None:
+            result = self._collect_social_buzz_coingecko(asset)
+
+        self._cache_set(f"buzz_{asset}", result)
+        return result
+
+    def _collect_social_buzz_coingecko(self, asset: str) -> dict:
+        """
+        CoinGecko fallback for social buzz.
+        Uses price_change_24h as sentiment and volume_change_24h as buzz proxy.
+        """
+        asset_id = "bitcoin" if asset.upper() == "BTC" else "ethereum"
         try:
             resp = self.session.get(
-                f"{NEWSAPI_URL}/everything",
+                f"{COINGECKO_URL}/simple/price",
                 params={
-                    "q": query,
-                    "language": "en",
-                    "sortBy": "publishedAt",
-                    "pageSize": 20,
-                    "from": self._thirty_min_ago_iso()
+                    "ids": asset_id,
+                    "vs_currencies": "usd",
+                    "include_24hr_vol": "true",
+                    "include_24hr_change": "true",
                 },
-                headers={"X-Api-Key": newsapi_key},
                 timeout=10
             )
             resp.raise_for_status()
-            data = resp.json()
+            data = resp.json().get(asset_id, {})
 
-            articles = data.get("articles", [])
-            count = len(articles)
+            price_change_24h = float(data.get("usd_24h_change") or 0.0)
+            vol_24h = float(data.get("usd_24h_vol") or 0.0)
 
-            volume_ratio = count / max(self._avg_news_count, 1)
+            # Maintain rolling vol baseline per asset
+            hist_attr = f"_buzz_vol_hist_{asset.lower()}"
+            vol_hist = getattr(self, hist_attr, [])
+            vol_hist.append(vol_24h)
+            if len(vol_hist) > 48:
+                vol_hist = vol_hist[-48:]
+            setattr(self, hist_attr, vol_hist)
+            avg_vol = sum(vol_hist) / len(vol_hist) if vol_hist else vol_24h
 
-            # Update rolling average
-            self._avg_news_count = 0.9 * self._avg_news_count + 0.1 * count
+            volume_ratio = vol_24h / avg_vol if avg_vol > 0 else 1.0
 
-            # Sentiment: simple keyword scoring
-            sentiment = self._score_sentiment(articles, asset)
+            # Sentiment: map price_change_24h to [-1, +1] with ±3% = full signal
+            sentiment = max(-1.0, min(1.0, price_change_24h / 3.0))
 
-            result = {
+            logger.info(
+                "SocialBuzz CoinGecko %s: price_24h=%.2f%% vol=$%.0f avg=$%.0f "
+                "vol_ratio=%.2fx sentiment=%.3f",
+                asset, price_change_24h, vol_24h, avg_vol, volume_ratio, sentiment
+            )
+            return {
                 "volume_ratio": volume_ratio,
                 "sentiment_score": sentiment,
-                "article_count": count,
-                "avg_baseline": self._avg_news_count
+                "article_count": 0,
+                "source": "coingecko",
+                "price_change_24h": price_change_24h,
             }
-            self._cache_set(f"buzz_{asset}", result)
-            logger.debug(
-                "SocialBuzz %s: articles=%d ratio=%.2f sentiment=%.2f",
-                asset, count, volume_ratio, sentiment
-            )
-            return result
-
         except Exception as e:
-            logger.debug("Social buzz fetch error: %s", e)
-            return {"volume_ratio": 1.0, "sentiment_score": 0.0, "error": str(e)}
+            logger.warning("SocialBuzz CoinGecko fallback failed for %s: %s", asset, e)
+            return {"volume_ratio": 1.0, "sentiment_score": 0.0, "source": "failed"}
 
-    def _thirty_min_ago_iso(self) -> str:
+    def _hours_ago_iso(self, hours: int) -> str:
         from datetime import datetime, timezone, timedelta
-        dt = datetime.now(timezone.utc) - timedelta(minutes=30)
+        dt = datetime.now(timezone.utc) - timedelta(hours=hours)
         return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _score_sentiment(self, articles: list, asset: str) -> float:
@@ -406,8 +469,9 @@ class EvidenceCollector:
 
     def collect_on_chain(self, asset: str) -> dict:
         """
-        Fetch mempool stats and on-chain activity signals.
-        Only BTC has mempool data (uses mempool.space).
+        Fetch on-chain activity signals.
+        BTC: mempool.space transaction count.
+        Both: CoinGecko 24h volume vs rolling average as volume-spike proxy.
         """
         cached = self._cache_get(f"onchain_{asset}")
         if cached:
@@ -416,6 +480,7 @@ class EvidenceCollector:
         mempool_count = 0
         volume_ratio = 1.0
 
+        # ── BTC: mempool.space ──────────────────────────────────────────────
         if asset.upper() == "BTC":
             try:
                 resp = self.session.get(
@@ -425,29 +490,58 @@ class EvidenceCollector:
                 resp.raise_for_status()
                 data = resp.json()
                 mempool_count = data.get("count", 0)
-                logger.debug("Mempool count: %d", mempool_count)
+                logger.info(
+                    "OnChain mempool.space raw: count=%d vsize=%s total_fee=%s",
+                    mempool_count,
+                    data.get("vsize", "?"),
+                    data.get("total_fee", "?"),
+                )
             except Exception as e:
-                logger.debug("Mempool fetch error: %s", e)
+                logger.info("OnChain mempool.space failed: %s — will use CoinGecko volume only", e)
 
-        # Volume spike proxy: use CoinGecko 24h volume
+        # ── Volume spike: CoinGecko 24h volume vs rolling average ───────────
         try:
             asset_id = "bitcoin" if asset.upper() == "BTC" else "ethereum"
-            cached_momentum = self._cache_get(f"momentum_{asset}")
+            resp_v = self.session.get(
+                f"{COINGECKO_URL}/simple/price",
+                params={
+                    "ids": asset_id,
+                    "vs_currencies": "usd",
+                    "include_24hr_vol": "true",
+                },
+                timeout=10
+            )
+            resp_v.raise_for_status()
+            vol_24h = float(
+                resp_v.json().get(asset_id, {}).get("usd_24h_vol") or 0.0
+            )
 
-            # If we have recent price data, compute approximate volume spike
-            # For now we use a neutral signal unless we see mempool congestion
-            volume_ratio = 1.0
+            hist_attr = f"_onchain_vol_hist_{asset.lower()}"
+            vol_hist = getattr(self, hist_attr, [])
+            vol_hist.append(vol_24h)
+            if len(vol_hist) > 48:
+                vol_hist = vol_hist[-48:]
+            setattr(self, hist_attr, vol_hist)
+            avg_vol = sum(vol_hist) / len(vol_hist) if vol_hist else vol_24h
 
+            volume_ratio = vol_24h / avg_vol if avg_vol > 0 else 1.0
+            logger.info(
+                "OnChain CoinGecko %s: vol_24h=$%.0f avg=$%.0f vol_ratio=%.2fx",
+                asset, vol_24h, avg_vol, volume_ratio
+            )
         except Exception as e:
-            logger.debug("On-chain volume error: %s", e)
+            logger.info("OnChain CoinGecko volume fetch failed for %s: %s", asset, e)
 
         result = {
             "mempool_count": mempool_count,
             "volume_ratio": volume_ratio,
-            "is_congested": mempool_count > 50000
+            "is_congested": mempool_count > 50000,
         }
         self._cache_set(f"onchain_{asset}", result)
-        logger.debug("OnChain %s: mempool=%d vol_ratio=%.2f", asset, mempool_count, volume_ratio)
+        logger.info(
+            "OnChain %s: mempool=%d vol_ratio=%.2fx congested=%s",
+            asset, mempool_count, volume_ratio, result["is_congested"]
+        )
         return result
 
     # ── Evidence 5: Market Sentiment (confluence) ──────────────────────────
@@ -462,8 +556,13 @@ class EvidenceCollector:
         Look at related markets (same asset, different strike/timeframe)
         to detect confluence signals.
         """
+        logger.info(
+            "MarketSentiment %s %s: checking %d related markets",
+            asset, direction, len(related_markets)
+        )
         if not related_markets:
-            return {"confluence_signal": 0.0, "confluence_direction": "neutral"}
+            return {"confluence_signal": 0.0, "confluence_direction": "neutral",
+                    "total_related": 0}
 
         same_direction = 0
         opposite_direction = 0
