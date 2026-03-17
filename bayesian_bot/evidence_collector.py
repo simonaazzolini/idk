@@ -137,87 +137,112 @@ class EvidenceCollector:
 
     # ── Evidence 2: Price Momentum ─────────────────────────────────────────
 
+    def _fetch_prices_binance(self, asset: str) -> List[float]:
+        """
+        Fetch recent 1-minute candles from Binance public API.
+        No API key required. Returns list of close prices (newest last).
+        """
+        symbol = "BTCUSDT" if asset.upper() == "BTC" else "ETHUSDT"
+        try:
+            resp = self.session.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": symbol, "interval": "1m", "limit": 60},
+                timeout=10
+            )
+            resp.raise_for_status()
+            candles = resp.json()
+            # Each candle: [open_time, open, high, low, close, ...]
+            return [float(c[4]) for c in candles]
+        except Exception as e:
+            logger.debug("Binance price fetch for %s: %s", asset, e)
+            return []
+
+    def _fetch_prices_coingecko(self, asset: str) -> List[float]:
+        """Fetch price history from CoinGecko free API."""
+        asset_id = "bitcoin" if asset.upper() == "BTC" else "ethereum"
+        try:
+            resp = self.session.get(
+                f"{COINGECKO_URL}/coins/{asset_id}/market_chart",
+                params={"vs_currency": "usd", "days": "1"},
+                timeout=15
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            prices_raw = data.get("prices", [])
+            return [p[1] for p in prices_raw]
+        except Exception as e:
+            logger.debug("CoinGecko price fetch for %s: %s", asset, e)
+            return []
+
     def collect_price_momentum(self, asset: str) -> Tuple[dict, List[float]]:
         """
-        Fetch CoinGecko price history and compute momentum signals.
+        Fetch price history and compute momentum signals.
+        Primary: Binance 1-minute candles. Fallback: CoinGecko.
         Returns (momentum_dict, price_history_list)
         """
         cached = self._cache_get(f"momentum_{asset}")
         if cached:
             return cached
 
-        asset_id = "bitcoin" if asset.upper() == "BTC" else "ethereum"
-        try:
-            resp = self.session.get(
-                f"{COINGECKO_URL}/coins/{asset_id}/market_chart",
-                params={
-                    "vs_currency": "usd",
-                    "days": "1",
-                    "interval": "minute"
-                },
-                timeout=15
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        # Try Binance first (more reliable, no rate limits for public data)
+        prices = self._fetch_prices_binance(asset)
 
-            prices_raw = data.get("prices", [])
-            if not prices_raw:
-                return self._empty_momentum(), []
+        # Fall back to CoinGecko
+        if not prices:
+            logger.debug("Binance unavailable for %s, trying CoinGecko", asset)
+            prices = self._fetch_prices_coingecko(asset)
 
-            prices = [p[1] for p in prices_raw]
-
-            # Update rolling history
-            if asset.upper() == "BTC":
-                self._price_history_btc = prices
-            else:
-                self._price_history_eth = prices
-
-            now_price = prices[-1]
-
-            def get_return(minutes_back: int) -> float:
-                idx = max(0, len(prices) - minutes_back - 1)
-                old = prices[idx]
-                if old == 0:
-                    return 0.0
-                return (now_price - old) / old
-
-            ret_1min = get_return(1)
-            ret_5min = get_return(5)
-            ret_15min = get_return(15)
-
-            # ATR-like volatility
-            recent = prices[-20:] if len(prices) >= 20 else prices
-            if len(recent) > 1:
-                ranges = [abs(recent[i] - recent[i-1]) / recent[i-1] for i in range(1, len(recent))]
-                atr = sum(ranges) / len(ranges)
-                # Compare to longer-term ATR
-                longer = prices[-60:] if len(prices) >= 60 else prices
-                long_ranges = [abs(longer[i] - longer[i-1]) / longer[i-1] for i in range(1, len(longer))]
-                long_atr = sum(long_ranges) / len(long_ranges) if long_ranges else atr
-                atr_ratio = atr / long_atr if long_atr > 0 else 1.0
-            else:
-                atr = 0.0
-                atr_ratio = 1.0
-
-            result = {
-                "current_price": now_price,
-                "ret_1min": ret_1min,
-                "ret_5min": ret_5min,
-                "ret_15min": ret_15min,
-                "atr": atr,
-                "atr_ratio": atr_ratio,
-                "price_count": len(prices)
-            }
-            self._cache_set(f"momentum_{asset}", (result, prices))
-            logger.debug(
-                "Momentum %s: price=%.2f ret5m=%.3f%% atr_ratio=%.2fx",
-                asset, now_price, ret_5min * 100, atr_ratio
-            )
-            return result, prices
-
-        except Exception as e:
-            logger.debug("Price momentum fetch error for %s: %s", asset, e)
+        if not prices:
+            logger.warning("All price sources failed for %s", asset)
             return self._empty_momentum(), []
+
+        # Update rolling history
+        if asset.upper() == "BTC":
+            self._price_history_btc = prices
+        else:
+            self._price_history_eth = prices
+
+        now_price = prices[-1]
+
+        def get_return(minutes_back: int) -> float:
+            idx = max(0, len(prices) - minutes_back - 1)
+            old = prices[idx]
+            if old == 0:
+                return 0.0
+            return (now_price - old) / old
+
+        ret_1min = get_return(1)
+        ret_5min = get_return(5)
+        ret_15min = get_return(15)
+
+        # ATR-like volatility
+        recent = prices[-20:] if len(prices) >= 20 else prices
+        if len(recent) > 1:
+            ranges = [abs(recent[i] - recent[i-1]) / recent[i-1] for i in range(1, len(recent))]
+            atr = sum(ranges) / len(ranges)
+            longer = prices[-60:] if len(prices) >= 60 else prices
+            long_ranges = [abs(longer[i] - longer[i-1]) / longer[i-1] for i in range(1, len(longer))]
+            long_atr = sum(long_ranges) / len(long_ranges) if long_ranges else atr
+            atr_ratio = atr / long_atr if long_atr > 0 else 1.0
+        else:
+            atr = 0.0
+            atr_ratio = 1.0
+
+        result = {
+            "current_price": now_price,
+            "ret_1min": ret_1min,
+            "ret_5min": ret_5min,
+            "ret_15min": ret_15min,
+            "atr": atr,
+            "atr_ratio": atr_ratio,
+            "price_count": len(prices)
+        }
+        self._cache_set(f"momentum_{asset}", (result, prices))
+        logger.debug(
+            "Momentum %s: price=%.2f ret5m=%.3f%% atr_ratio=%.2fx",
+            asset, now_price, ret_5min * 100, atr_ratio
+        )
+        return result, prices
 
     def _empty_momentum(self) -> dict:
         return {
