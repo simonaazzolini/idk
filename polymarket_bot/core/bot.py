@@ -8,6 +8,8 @@ import asyncio
 import json
 import logging
 import math
+import re
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -94,6 +96,8 @@ class PolymarketBot:
         self._api_calls_today: int = 0
         self._paper_start_ts: float = 0.0
         self._paper_evaluated_at: float = 0.0
+        # Cached CoinGecko spot prices {asset: (price_usd, fetched_ts)}
+        self._spot_prices: dict[str, tuple[float, float]] = {}
         # Diagnostic counters — reset each cycle, exposed via /api/debug
         self._diag: dict = {
             "last_cycle_duration_s": 0.0,
@@ -295,9 +299,19 @@ class PolymarketBot:
         if not markets:
             logger.warning("No markets found, skipping cycle")
             return
+
+        # Step 1.5: Reality check — drop price-target markets with impossible moves
+        markets = await self._apply_reality_check(markets)
+        if not markets:
+            logger.warning("All markets removed by reality check, skipping cycle")
+            return
+
         self._current_markets = markets
         self.dashboard.markets_tracked = len(markets)
-        print(f"[CYCLE] STEP1 markets_discovered={len(markets)} top_slug={markets[0].get('slug','?')[:30] if markets else 'NONE'}")
+        spot = {a: p for a, (p, _) in self._spot_prices.items()}
+        btc_str = f"BTC=${spot['BTC']:,.0f}" if "BTC" in spot else "BTC=?"
+        eth_str = f"ETH=${spot['ETH']:,.2f}" if "ETH" in spot else "ETH=?"
+        print(f"[CYCLE] STEP1 markets_discovered={len(markets)} {btc_str} {eth_str} top_slug={markets[0].get('slug','?')[:30] if markets else 'NONE'}")
 
         # Check paper/live timer
         await self._check_paper_timer()
@@ -353,7 +367,7 @@ class PolymarketBot:
         if can_trade:
             self._ai_results = await self.ai_analyzer.analyze_batch(
                 markets=markets,
-                max_markets=10,
+                max_markets=15,
                 technical_signals=self._technical_signals,
                 whale_consensuses=self._whale_consensuses,
                 news_results=self._news_results,
@@ -599,6 +613,129 @@ class PolymarketBot:
 
         logger.info("Discovered %d scored markets from %d total", len(scored), len(raw_markets))
         return scored[:self.settings.top_markets_count]
+
+    # ── Reality check ─────────────────────────────────────────────────────────
+
+    # 15-min 1-sigma volatility estimates (fraction) for each asset.
+    # 3× this is the ceiling we use for "realistically reachable" moves.
+    _ASSET_15MIN_VOL: dict[str, float] = {
+        "BTC": 0.0020,   # 0.20% per 15 min  → 3× ceiling = 0.60%
+        "ETH": 0.0025,   # 0.25% per 15 min  → 3× ceiling = 0.75%
+    }
+
+    async def _fetch_spot_prices(self) -> dict[str, float]:
+        """Return cached CoinGecko spot prices, refreshing if older than 60 s."""
+        now = time.time()
+        need_refresh = any(
+            now - ts > 60
+            for _, (_, ts) in self._spot_prices.items()
+        ) or not self._spot_prices
+
+        if need_refresh:
+            try:
+                import aiohttp
+                url = (
+                    "https://api.coingecko.com/api/v3/simple/price"
+                    "?ids=bitcoin,ethereum&vs_currencies=usd"
+                )
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        data = await resp.json()
+                btc = float(data["bitcoin"]["usd"])
+                eth = float(data["ethereum"]["usd"])
+                self._spot_prices["BTC"] = (btc, now)
+                self._spot_prices["ETH"] = (eth, now)
+                logger.info("CoinGecko prices: BTC=$%s  ETH=$%s",
+                            f"{btc:,.0f}", f"{eth:,.2f}")
+            except Exception as e:
+                logger.warning("CoinGecko price fetch failed: %s", e)
+
+        return {
+            asset: price
+            for asset, (price, _) in self._spot_prices.items()
+        }
+
+    @staticmethod
+    def _parse_price_target(question: str) -> tuple[str, float] | None:
+        """
+        Extract (asset, target_usd) from questions like:
+          "Will BTC be above $78,000 at…"
+          "Will Ethereum exceed $3,500?"
+        Returns None if the question is not a numeric price-target market.
+        """
+        asset_map = {
+            "bitcoin": "BTC", "btc": "BTC",
+            "ethereum": "ETH", "eth": "ETH",
+        }
+        q = question.lower()
+        asset = None
+        for kw, sym in asset_map.items():
+            if kw in q:
+                asset = sym
+                break
+        if not asset:
+            return None
+
+        # Match $78,000 or $78000 or 78000 (with optional commas)
+        m = re.search(r"\$\s?([\d,]+(?:\.\d+)?)", question)
+        if not m:
+            return None
+        try:
+            target = float(m.group(1).replace(",", ""))
+        except ValueError:
+            return None
+        return (asset, target)
+
+    async def _apply_reality_check(self, markets: list[dict]) -> list[dict]:
+        """
+        Filter out price-target markets whose target is physically unreachable
+        given current spot price and time remaining.
+        """
+        spot = await self._fetch_spot_prices()
+        if not spot:
+            # CoinGecko unavailable — pass all markets through
+            return markets
+
+        passed, skipped = [], 0
+        for market in markets:
+            question = market.get("question", "")
+            parsed = self._parse_price_target(question)
+            if not parsed:
+                # Not a numeric price-target market — always pass through
+                passed.append(market)
+                continue
+
+            asset, target = parsed
+            current = spot.get(asset)
+            if not current:
+                passed.append(market)
+                continue
+
+            days = float(market.get("days_to_resolution") or 30.0)
+            minutes_remaining = days * 24 * 60
+
+            # Maximum realistic move = 3× per-15min vol × √(minutes/15)
+            base_vol = self._ASSET_15MIN_VOL.get(asset, 0.002)
+            max_move_frac = 3.0 * base_vol * math.sqrt(max(minutes_remaining, 1) / 15.0)
+
+            required_move = abs(target - current) / current
+            if required_move > max_move_frac:
+                max_pct = max_move_frac * 100
+                req_pct = required_move * 100
+                logger.info(
+                    "REALITY CHECK FAILED: %s | current=%s target=%s"
+                    " | needs %.1f%% move in %.0fmin, max realistic=%.1f%%",
+                    question[:60],
+                    f"${current:,.0f}", f"${target:,.0f}",
+                    req_pct, minutes_remaining, max_pct,
+                )
+                skipped += 1
+            else:
+                passed.append(market)
+
+        if skipped:
+            logger.info("Reality check removed %d impossible market(s), %d remain", skipped, len(passed))
+        return passed
 
     def _filter_and_score_markets(self, raw_markets: list[dict]) -> list[dict]:
         """Apply filters and compute opportunity scores."""

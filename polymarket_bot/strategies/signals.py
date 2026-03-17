@@ -326,30 +326,30 @@ class SignalAggregator:
             if arb_score >= 9.0:
                 sig.action = "STRONG_BUY"
                 sig.final_direction = "YES"  # Arb specific legs handled elsewhere
-            elif sig.composite_score >= 5.5 and abs_edge >= 0.04:
+            elif sig.composite_score >= 5.0 and abs_edge >= 0.03:
                 sig.action = "STRONG_BUY"
                 if ai_edge < 0:
                     sig.final_direction = "NO"
-            elif sig.composite_score >= 5.5 and sig.final_direction != "NEUTRAL":
+            elif sig.composite_score >= 5.0 and sig.final_direction != "NEUTRAL":
                 # Non-trivial composite with clear direction: BUY even without large edge.
                 # Catches markets where price-based signals agree but AI edge is small.
                 sig.action = "BUY"
                 if ai_edge < 0:
                     sig.final_direction = "NO"
-            elif sig.composite_score >= 4.0 and abs_edge >= 0.02:
+            elif sig.composite_score >= 3.5 and abs_edge >= 0.015:
                 sig.action = "BUY"
                 if ai_edge < 0:
                     sig.final_direction = "NO"
-            elif sig.composite_score >= 3.0 and abs_edge >= 0.01:
+            elif sig.composite_score >= 2.5 and abs_edge >= 0.008:
                 sig.action = "WEAK_BUY"
                 if ai_edge < 0:
                     sig.final_direction = "NO"
             else:
                 sig.action = "SKIP"
                 reasons = []
-                if abs_edge < 0.01:
+                if abs_edge < 0.008:
                     reasons.append(f"edge too small ({ai_edge:+.3f})")
-                if sig.composite_score < 3.0:
+                if sig.composite_score < 2.5:
                     reasons.append(f"score too low ({sig.composite_score:.2f})")
                 sig.reason_skipped = ", ".join(reasons) or "insufficient signal"
 
@@ -367,7 +367,7 @@ class SignalAggregator:
                 )
 
             # AI confidence gate — only applies when AI is actually available
-            if not _no_anthropic and sig.ai_confidence < 0.40:
+            if not _no_anthropic and sig.ai_confidence < 0.35:
                 sig.action = "SKIP"
                 sig.reason_skipped = f"AI confidence too low ({sig.ai_confidence:.2f})"
 
