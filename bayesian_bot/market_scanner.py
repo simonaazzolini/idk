@@ -49,10 +49,22 @@ class MarketInfo:
     def is_valid(self, config) -> bool:
         """Check if market passes all filters."""
         if self.minutes_to_resolution < config.min_market_window_minutes:
+            logger.debug(
+                "FILTER: %s too soon (%.1fmin < %dmin min)",
+                self.question[:40], self.minutes_to_resolution, config.min_market_window_minutes
+            )
             return False
         if self.minutes_to_resolution > config.max_market_window_minutes:
+            logger.debug(
+                "FILTER: %s too far (%.0fmin > %dmin max)",
+                self.question[:40], self.minutes_to_resolution, config.max_market_window_minutes
+            )
             return False
         if self.volume_usd < config.min_market_volume:
+            logger.debug(
+                "FILTER: %s low volume ($%.0f < $%.0f min)",
+                self.question[:40], self.volume_usd, config.min_market_volume
+            )
             return False
         return True
 
@@ -185,6 +197,9 @@ class MarketScanner:
 
     def _fetch_markets(self, limit: int = 200) -> List[dict]:
         """Fetch active markets from Gamma API."""
+        all_markets = []
+
+        # Primary fetch — general active markets
         try:
             resp = self.session.get(
                 f"{GAMMA_URL}/markets",
@@ -200,11 +215,46 @@ class MarketScanner:
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, list):
-                return data
-            return data.get("markets", data.get("data", []))
+                all_markets.extend(data)
+            else:
+                all_markets.extend(data.get("markets", data.get("data", [])))
         except Exception as e:
-            logger.warning("Failed to fetch markets from Gamma: %s", e)
-            return []
+            logger.warning("Gamma API primary fetch failed: %s", e)
+
+        # Secondary fetch — crypto-tagged markets
+        try:
+            resp2 = self.session.get(
+                f"{GAMMA_URL}/markets",
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "limit": 100,
+                    "tag_id": "crypto",
+                    "order": "volume24hr",
+                    "ascending": "false"
+                },
+                timeout=15
+            )
+            if resp2.ok:
+                data2 = resp2.json()
+                extras = data2 if isinstance(data2, list) else data2.get("markets", data2.get("data", []))
+                # Deduplicate by id
+                existing_ids = {m.get("id") or m.get("conditionId") for m in all_markets}
+                for m in extras:
+                    mid = m.get("id") or m.get("conditionId")
+                    if mid not in existing_ids:
+                        all_markets.append(m)
+        except Exception as e:
+            logger.debug("Gamma API crypto fetch: %s", e)
+
+        if all_markets:
+            logger.debug("Gamma API returned %d total markets", len(all_markets))
+            # Log first market structure for debugging
+            if all_markets:
+                sample = all_markets[0]
+                logger.debug("Sample market keys: %s", list(sample.keys())[:15])
+
+        return all_markets
 
     def _fetch_clob_markets(self) -> List[dict]:
         """Fetch markets from CLOB API as fallback/supplement."""
@@ -302,6 +352,7 @@ class MarketScanner:
             raw_markets = self._fetch_clob_markets()
 
         candidates: List[MarketInfo] = []
+        rejected_crypto = []
 
         for raw in raw_markets:
             market = self.parse_market(raw)
@@ -312,11 +363,22 @@ class MarketScanner:
             if market.condition_id in self._open_positions:
                 continue
 
-            # Apply filters
+            # Apply filters with debug logging
             if not market.is_valid(self.config):
+                rejected_crypto.append(
+                    f"{market.asset} | {market.minutes_to_resolution:.0f}min | "
+                    f"vol=${market.volume_usd:.0f} | {market.question[:50]}"
+                )
                 continue
 
             candidates.append(market)
+
+        if rejected_crypto:
+            logger.debug(
+                "Rejected %d BTC/ETH markets (didn't pass filters):", len(rejected_crypto)
+            )
+            for r in rejected_crypto[:5]:
+                logger.debug("  ✗ %s", r)
 
         # Sort by volume (highest first)
         candidates.sort(key=lambda m: m.volume_usd, reverse=True)
@@ -325,8 +387,8 @@ class MarketScanner:
         self._last_scan = top
 
         logger.info(
-            "Market scan complete: %d candidates found, returning top %d",
-            len(candidates), len(top)
+            "Market scan complete: %d raw markets, %d BTC/ETH found, %d passed filters",
+            len(raw_markets), len(candidates) + len(rejected_crypto), len(candidates)
         )
         for m in top:
             logger.info(

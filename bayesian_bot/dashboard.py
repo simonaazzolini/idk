@@ -220,9 +220,7 @@ def health():
 def run_dashboard(host: str = "0.0.0.0", port: int = 8082, debug: bool = False) -> threading.Thread:
     """Start the Flask dashboard in a background thread."""
     def _run():
-        import os
-        os.environ["WERKZEUG_RUN_MAIN"] = "true"
-        app.run(host=host, port=port, debug=debug, use_reloader=False, threaded=True)
+        app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
 
     thread = threading.Thread(target=_run, daemon=True, name="dashboard")
     thread.start()

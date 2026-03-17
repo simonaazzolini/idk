@@ -31,10 +31,11 @@ import dashboard
 
 # ── Logging setup ──────────────────────────────────────────────────────────
 
-def setup_logging() -> None:
+def setup_logging(debug: bool = False) -> None:
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format=fmt,
         handlers=[
             logging.StreamHandler(sys.stdout),
@@ -391,7 +392,8 @@ class BayesianBot:
 # ── Entry point ────────────────────────────────────────────────────────────
 
 def main():
-    setup_logging()
+    debug = "--debug" in sys.argv
+    setup_logging(debug=debug)
     bot = BayesianBot()
     bot.run()
 
