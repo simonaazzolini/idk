@@ -79,6 +79,10 @@ Examples:
         "--test", action="store_true",
         help="Run module tests with mock data (no credentials required)"
     )
+    parser.add_argument(
+        "--arb-only", action="store_true",
+        help="Skip all signal trades; only execute arbitrage opportunities"
+    )
     return parser.parse_args()
 
 
@@ -95,6 +99,8 @@ def apply_overrides(s: Settings, args: argparse.Namespace) -> None:
         s.categories = args.categories
     if args.log_level:
         s.log_level = args.log_level
+    if args.arb_only:
+        s.arb_only = True
 
 
 async def run_tests() -> int:

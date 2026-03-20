@@ -124,6 +124,7 @@ class Settings:
     ai_min_call_interval_seconds: float = 8.0   # minimum seconds between every Claude API call
     ai_max_calls_per_minute: int = 8            # rate-limit window: halt when this many calls in 60s
     categories: list = field(default_factory=list)  # empty = all categories
+    arb_only: bool = False                      # when True: skip all signal trades, execute arbs only
 
     def validate(self) -> list[str]:
         """Return list of validation errors. Empty list means OK."""

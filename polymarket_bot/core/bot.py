@@ -437,6 +437,13 @@ class PolymarketBot:
                     _arb_executed += 1
                 # Live mode: execute TYPE_1/TYPE_2 only (mechanical arb, no AI needed)
                 elif arb.profit_pct >= 0.005 and arb.arb_type in ("TYPE_1_YES_NO_SUM", "TYPE_2_CATEGORICAL"):
+                    # Balance check — must have before issuing any real orders.
+                    if arb.max_size > self.portfolio.state.cash_balance:
+                        logger.warning(
+                            "ARB SKIP (insufficient cash): need $%.2f, have $%.2f — %s",
+                            arb.max_size, self.portfolio.state.cash_balance, arb.market_slug[:25],
+                        )
+                        continue
                     logger.info(
                         "ARB EXECUTE (live): %s %s profit=%.4f (%.2f%%)",
                         arb.arb_type, arb.market_slug[:25],
@@ -548,6 +555,11 @@ class PolymarketBot:
                         _no_trade_reasons.append(
                             f"{signal.market_slug[:20]}: {signal.reason_skipped}"
                         )
+                    continue
+                if self.settings.arb_only:
+                    logger.debug(
+                        "ARB_ONLY mode: skipping signal trade for %s", signal.market_slug[:30]
+                    )
                     continue
                 print(f"[CYCLE] STEP10 CALLING _execute_signal slug={signal.market_slug[:30]} action={signal.action} score={signal.composite_score:.2f} dir={signal.final_direction}")
                 await self._execute_signal(signal, markets)
