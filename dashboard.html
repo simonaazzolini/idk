@@ -535,8 +535,7 @@
       <div class="card">
         <h3>Bot Controls</h3>
         <div class="btn-group">
-          <button class="btn btn-success" id="ctrl-start-paper">▶ Start (Paper)</button>
-          <button class="btn btn-success" id="ctrl-start-live">▶ Start (Live)</button>
+          <button class="btn btn-success" id="ctrl-start-bot">▶ Start Bot</button>
           <button class="btn btn-success" id="ctrl-resume">↺ Resume</button>
           <button class="btn btn-warn"    id="ctrl-pause">⏸ Pause</button>
           <button class="btn btn-danger"  id="ctrl-stop">⏹ Stop</button>
@@ -598,6 +597,35 @@
     <div class="modal-btns">
       <button class="btn" id="modal-cancel-btn">Cancel</button>
       <button class="btn btn-danger" id="modal-confirm-btn">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- Start Bot modal — separate from generic modal so it can hold multiple fields -->
+<div id="start-bot-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:8001; align-items:center; justify-content:center;">
+  <div id="modal-box" style="max-width:460px;">
+    <h2>▶ Start Bot</h2>
+    <div class="form-group" style="margin-bottom:12px;">
+      <label style="display:block;margin-bottom:4px;font-size:13px;color:var(--text-dim)">Mode</label>
+      <select id="start-mode-select" style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:14px;">
+        <option value="paper">PAPER — simulate trades, no real money</option>
+        <option value="live">LIVE — real USDC trading</option>
+      </select>
+    </div>
+    <div class="form-group" style="margin-bottom:12px;">
+      <label style="display:block;margin-bottom:4px;font-size:13px;color:var(--text-dim)">Budget (USDC)</label>
+      <input type="number" id="start-budget-input" step="1" min="10"
+             style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:14px;box-sizing:border-box;" />
+    </div>
+    <div id="start-live-warning" style="display:none;background:rgba(220,50,50,.15);border:1px solid #c0392b;border-radius:6px;padding:12px 14px;margin-bottom:14px;">
+      <p style="color:#e74c3c;font-weight:600;margin:0 0 8px;">⚠ This will trade real USDC</p>
+      <p style="color:var(--text-dim);font-size:13px;margin:0 0 10px;">Type <strong>CONFIRM LIVE TRADING</strong> exactly to proceed:</p>
+      <input type="text" id="start-confirm-phrase" placeholder="CONFIRM LIVE TRADING"
+             style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:14px;box-sizing:border-box;" />
+    </div>
+    <div class="modal-btns">
+      <button class="btn" id="start-modal-cancel">Cancel</button>
+      <button class="btn btn-success" id="start-modal-confirm">▶ Start</button>
     </div>
   </div>
 </div>
@@ -1258,22 +1286,53 @@ async function ctrl(action, extra={}) {
   else toast(res?.detail || 'Action failed', 'error');
 }
 
-async function startBot(mode) {
-  const ok = await showModal(
-    `▶ Start Bot (${mode.toUpperCase()})`,
-    mode === 'live'
-      ? 'Start the bot in LIVE mode with real money?'
-      : 'Start the bot in paper trading mode?',
-    { confirmClass: mode === 'live' ? 'btn-danger' : 'btn-success' }
-  );
-  if (!ok) return;
-  const budget = parseFloat($('settings-form')?.elements['budget']?.value) || undefined;
+// ── Start Bot modal ────────────────────────────────────────────────────────
+const _startOverlay = $('start-bot-overlay');
+const _startModeEl  = $('start-mode-select');
+const _startBudget  = $('start-budget-input');
+const _startWarning = $('start-live-warning');
+const _startPhrase  = $('start-confirm-phrase');
+
+_startModeEl.onchange = () => {
+  const live = _startModeEl.value === 'live';
+  _startWarning.style.display = live ? 'block' : 'none';
+  $('start-modal-confirm').className = live ? 'btn btn-danger' : 'btn btn-success';
+  $('start-modal-confirm').textContent = live ? '⚡ Start Live' : '▶ Start';
+};
+
+$('start-modal-cancel').onclick = () => { _startOverlay.style.display = 'none'; };
+
+$('start-modal-confirm').onclick = async () => {
+  const mode   = _startModeEl.value;
+  const budget = parseFloat(_startBudget.value) || undefined;
+  if (mode === 'live') {
+    if (_startPhrase.value.trim() !== 'CONFIRM LIVE TRADING') {
+      toast('Type "CONFIRM LIVE TRADING" exactly to start live', 'error');
+      return;
+    }
+  }
+  _startOverlay.style.display = 'none';
   const res = await apiPost('/api/control', { action: 'start', mode, budget });
   if (res?.success) { toast(res.message || 'Bot starting…', 'success'); setTimeout(refreshAll, 1500); }
   else toast(res?.message || 'Start failed', 'error');
+};
+
+async function openStartBotModal() {
+  // Pre-fill from last known state
+  const status = await apiFetch('/api/status').catch(() => null);
+  const lastMode   = (status?.mode || 'PAPER').toLowerCase();
+  const lastBudget = $('settings-form')?.elements['budget']?.value
+                     || (status?.settings?.budget ?? 1000);
+
+  _startModeEl.value  = lastMode === 'live' ? 'live' : 'paper';
+  _startBudget.value  = lastBudget;
+  _startPhrase.value  = '';
+  // trigger display update
+  _startModeEl.onchange();
+  _startOverlay.style.display = 'flex';
 }
-$('ctrl-start-paper').onclick = () => startBot('paper');
-$('ctrl-start-live').onclick  = () => startBot('live');
+
+$('ctrl-start-bot').onclick = openStartBotModal;
 $('ctrl-resume').onclick = () => ctrl('resume');
 $('ctrl-pause').onclick  = async () => {
   const ok = await showModal('Pause Bot', 'Pause the bot? Trading will halt until you click Resume.');

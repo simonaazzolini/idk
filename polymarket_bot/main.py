@@ -3,23 +3,17 @@ Main entry point — Module 14.
 CLI for starting the Polymarket trading bot.
 """
 import sys
-import io
+import os
 
 # Fix bad file descriptor on restart — must happen before any other imports
-# that may write to stdout/stderr.
-try:
-    sys.stdout.flush()
-except Exception:
-    pass
-try:
-    sys.stderr.flush()
-except Exception:
-    pass
-# Redirect broken streams to devnull so logging doesn't raise on restart
-if sys.stdout is None or sys.stdout.fileno() < 0:
-    sys.stdout = open('/dev/null', 'w')
-if sys.stderr is None or sys.stderr.fileno() < 0:
-    sys.stderr = open('/dev/null', 'w')
+# that may write to stdout/stderr.  Uses os.fstat() to detect fds that are
+# present in sys but point to a closed OS-level descriptor (a common failure
+# mode when the process is launched as a subprocess with redirected streams).
+for _fd in (0, 1, 2):
+    try:
+        os.fstat(_fd)
+    except OSError:
+        open(os.devnull, 'rb' if _fd == 0 else 'wb')
 
 import argparse
 import asyncio

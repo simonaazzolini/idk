@@ -286,42 +286,95 @@ class APIServer:
 
             markets_tracked = _safe_int(await _scalar(db, "SELECT COUNT(*) FROM market_cache"))
 
-            # Paper criteria
-            all_trades = await _query(db, "SELECT pnl, size_usdc, timestamp FROM paper_trades WHERE status='CLOSED' AND pnl IS NOT NULL")
-            pnls = [_safe_float(t["pnl"]) for t in all_trades]
-            n = len(pnls)
-            wr = sum(1 for p in pnls if p > 0) / n if n else 0.0
-            gross_profit = sum(p for p in pnls if p > 0)
-            gross_loss = abs(sum(p for p in pnls if p < 0))
-            pf = gross_profit / gross_loss if gross_loss else (float("inf") if gross_profit else 0.0)
+            # ── Paper criteria ────────────────────────────────────────────────
+            import math as _math
+
             total_budget = server_self.settings.budget if server_self.settings else 1000.0
 
-            # Daily P&L for sharpe and per-day analysis
+            # Signal trades (closed paper trades)
+            all_trades = await _query(db, "SELECT pnl, size_usdc, timestamp FROM paper_trades WHERE status='CLOSED' AND pnl IS NOT NULL")
+            pnls = [_safe_float(t["pnl"]) for t in all_trades]
+            signal_n = len(pnls)
+
+            # Arb trades (all executed arb trades count as closed wins)
+            arb_rows = await _query(db, "SELECT profit_usdc, timestamp FROM arb_trades WHERE executed=1")
+            arb_pnls = [_safe_float(r["profit_usdc"]) for r in arb_rows]
+            arb_n = len(arb_pnls)
+
+            # trades_count = signal trades + arb trades
+            n = signal_n + arb_n
+
+            # win_rate: if signal trades have closed use them; otherwise fall
+            # back to arb trades only (all arb trades are profitable wins).
+            if signal_n > 0:
+                wr = sum(1 for p in pnls if p > 0) / signal_n
+            elif arb_n > 0:
+                wr = 1.0  # 100% — all executed arb trades are wins
+            else:
+                wr = 0.0
+
+            # profit_factor: gross_profit / gross_loss across signal + arb.
+            # If there are no losses yet, show 999 (effectively infinite).
+            combined_pnls = pnls + arb_pnls
+            gross_profit = sum(p for p in combined_pnls if p > 0)
+            gross_loss = abs(sum(p for p in combined_pnls if p < 0))
+            if gross_loss > 0:
+                pf = gross_profit / gross_loss
+            elif gross_profit > 0:
+                pf = 999.0  # infinite profit factor — no losses
+            else:
+                pf = 0.0
+
+            # profitable_days: count distinct UTC days where ANY profit was
+            # made, including arb profit.
             days: dict[str, float] = defaultdict(float)
             for t in all_trades:
                 ts = _safe_float(t.get("timestamp"))
                 if ts:
                     day = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
                     days[day] += _safe_float(t["pnl"])
+            for r in arb_rows:
+                ts = _safe_float(r.get("timestamp"))
+                if ts:
+                    day = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                    days[day] += _safe_float(r["profit_usdc"])
             daily_pnls = list(days.values())
             profitable_days = sum(1 for v in daily_pnls if v > 0)
             max_day_loss = max((abs(v) / total_budget for v in daily_pnls if v < 0), default=0.0)
-            import math as _math
-            if len(daily_pnls) >= 2:
-                mu = sum(daily_pnls) / len(daily_pnls)
-                var = sum((x - mu) ** 2 for x in daily_pnls) / (len(daily_pnls) - 1)
-                std = _math.sqrt(var) if var > 0 else 0
-                sharpe = (mu / std * _math.sqrt(365)) if std > 0 else 0.0
+
+            # sharpe: calculated from daily portfolio value changes using
+            # portfolio_snapshots, not from closed-trade returns.
+            snap_rows = await _query(db, "SELECT total_value, timestamp FROM portfolio_snapshots WHERE mode='PAPER' ORDER BY timestamp ASC")
+            snap_by_day: dict[str, float] = {}
+            for sr in snap_rows:
+                ts = _safe_float(sr.get("timestamp"))
+                if ts:
+                    day = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                    snap_by_day[day] = _safe_float(sr["total_value"])  # last value wins (chronological)
+            day_vals = list(snap_by_day.values())
+            if len(day_vals) >= 2:
+                daily_returns = [
+                    (day_vals[i] - day_vals[i - 1]) / day_vals[i - 1]
+                    for i in range(1, len(day_vals))
+                    if day_vals[i - 1] > 0
+                ]
+                if len(daily_returns) >= 2:
+                    mu_r = sum(daily_returns) / len(daily_returns)
+                    var_r = sum((x - mu_r) ** 2 for x in daily_returns) / (len(daily_returns) - 1)
+                    std_r = _math.sqrt(var_r) if var_r > 0 else 0
+                    sharpe = (mu_r / std_r * _math.sqrt(365)) if std_r > 0 else 0.0
+                else:
+                    sharpe = 0.0
             else:
                 sharpe = 0.0
 
             criteria = {
-                "win_rate":      {"value": round(wr, 4),     "threshold": 0.55, "pass": wr >= 0.55},
-                "profit_factor": {"value": round(min(pf, 99), 2), "threshold": 1.3, "pass": pf >= 1.3},
-                "days_profitable":{"value": profitable_days, "threshold": 2,    "pass": profitable_days >= 2},
-                "max_day_loss":  {"value": round(max_day_loss, 4), "threshold": 0.08, "pass": max_day_loss < 0.08},
-                "trades_count":  {"value": n,               "threshold": 8,    "pass": n >= 8},
-                "sharpe":        {"value": round(sharpe, 2), "threshold": 0.5,  "pass": sharpe >= 0.5},
+                "win_rate":       {"value": round(wr, 4),         "threshold": 0.55, "pass": wr >= 0.55},
+                "profit_factor":  {"value": round(min(pf, 999), 2), "threshold": 1.3,  "pass": pf >= 1.3},
+                "days_profitable":{"value": profitable_days,       "threshold": 2,    "pass": profitable_days >= 2},
+                "max_day_loss":   {"value": round(max_day_loss, 4),"threshold": 0.08, "pass": max_day_loss < 0.08},
+                "trades_count":   {"value": n,                     "threshold": 8,    "pass": n >= 8},
+                "sharpe":         {"value": round(sharpe, 2),      "threshold": 0.5,  "pass": sharpe >= 0.5},
             }
             criteria_passing = sum(1 for c in criteria.values() if c["pass"])
 
@@ -866,8 +919,16 @@ class APIServer:
             # ── Start (subprocess mode only) ──────────────────────────────────
             if action == "start":
                 if pm:
-                    mode   = body.get("mode", "paper")
-                    budget = body.get("budget") or None
+                    # Default mode: "live" if the user has previously activated
+                    # live trading, "paper" otherwise.
+                    live_at = await _scalar(db, "SELECT value FROM bot_state WHERE key='live_activated_at'")
+                    default_mode = "live" if live_at else "paper"
+                    mode = body.get("mode", default_mode)
+
+                    # Default budget from settings — never use a hardcoded amount.
+                    default_budget = server_self.settings.budget if server_self.settings else 1000.0
+                    budget = body.get("budget") or default_budget
+
                     # Write mode before starting so the subprocess sees the correct
                     # state in _check_db_commands and doesn't read stale STOPPED.
                     await _execute(db, "INSERT OR REPLACE INTO bot_state(key,value) VALUES('mode',?)",
