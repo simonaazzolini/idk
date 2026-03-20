@@ -792,11 +792,16 @@ class PolymarketBot:
         # ── Duplicate-trade guard ─────────────────────────────────────────────
         # Must be the very first check so no downstream logic (Kelly, order
         # placement, portfolio update) runs when a position already exists.
-        if await self._has_open_position(signal.market_slug):
-            logger.info(
-                "DUPLICATE SKIP: %s — position already open in mode=%s",
-                signal.market_slug, self.mode,
-            )
+        market_slug = signal.market_slug
+        logger.info(
+            "DUPLICATE CHECK: slug=%r mode=%s", market_slug, self.mode
+        )
+        has_pos = await self._has_open_position(market_slug)
+        logger.info(
+            "DUPLICATE CHECK RESULT: slug=%r has_position=%s", market_slug, has_pos
+        )
+        if has_pos:
+            logger.info("DUPLICATE SKIP: %s — position already open in mode=%s", market_slug, self.mode)
             return
 
         market = next(

@@ -371,14 +371,25 @@ class Database:
     async def has_open_position(self, market_slug: str, mode: str) -> bool:
         """Return True if there is already an open/pending position for this market."""
         table = "paper_trades" if mode == "PAPER" else "trades"
-        async with self._get_conn() as db:
-            async with db.execute(
-                f"SELECT COUNT(*) FROM {table} "
-                "WHERE market_slug = ? AND status IN ('OPEN', 'FILLED', 'PENDING')",
-                (market_slug,),
-            ) as cur:
-                row = await cur.fetchone()
-                return bool(row and row[0] > 0)
+        try:
+            async with self._get_conn() as conn:
+                async with conn.execute(
+                    f"SELECT COUNT(*) FROM {table} "
+                    "WHERE market_slug = ? AND status NOT IN ('CLOSED', 'RESOLVED', 'CANCELLED')",
+                    (market_slug,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    count = row[0] if row else 0
+                    if count > 0:
+                        logger.info(
+                            "DUPLICATE BLOCKED: %s already has %d open position(s) in %s",
+                            market_slug, count, table,
+                        )
+                        return True
+                    return False
+        except Exception as e:
+            logger.error("has_open_position error for %s: %s", market_slug, e)
+            return False
 
     async def get_open_trades(self, mode: str) -> list[dict]:
         table = "paper_trades" if mode == "PAPER" else "trades"

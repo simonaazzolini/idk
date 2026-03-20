@@ -98,9 +98,20 @@ class PortfolioManager:
         self.state.current_exposure = deployed
         self.state.cash_balance = max(0.0, self.state.total_budget - deployed)
 
+        # Restore realized P&L from ALL closed trades so it survives restarts.
+        # Without this, total_realized_pnl resets to 0 every time the bot starts.
+        closed = await self.db.get_all_closed_trades(self.state.mode)
+        self.state.total_realized_pnl = sum(
+            float(t.get("pnl") or 0) for t in closed if t.get("pnl") is not None
+        )
+        self.state.total_pnl = self.state.total_realized_pnl  # unrealized = 0 at init
+        self.state.roi_pct = (
+            safe_div(self.state.total_pnl, self.state.total_budget) * 100
+        )
+
         logger.info(
-            "Portfolio initialized: budget=$%.2f, exposure=$%.2f, positions=%d",
-            self.state.total_budget, deployed, len(open_trades)
+            "Portfolio initialized: budget=$%.2f, exposure=$%.2f, positions=%d, realized_pnl=$%.2f",
+            self.state.total_budget, deployed, len(open_trades), self.state.total_realized_pnl,
         )
 
     async def on_trade_opened(self, trade_id: int, size_usdc: float, fill_price: float) -> None:
@@ -363,9 +374,12 @@ class PortfolioManager:
     async def _save_daily_performance(self) -> None:
         """Save daily performance summary."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # day_start_ts is the Unix timestamp of UTC midnight for today.
+        today_dt = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_ts = today_dt.timestamp()
         closed_today = await self.db.get_trades_in_range(
             mode=self.state.mode,
-            start_ts=self.state.daily_start_value,
+            start_ts=day_start_ts,
             end_ts=now_ts(),
         )
         pnls = [float(t.get("pnl") or 0) for t in closed_today if t.get("pnl") is not None]
